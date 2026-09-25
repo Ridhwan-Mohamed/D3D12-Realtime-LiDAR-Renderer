@@ -1,0 +1,47 @@
+# Baseline Conditions
+
+## Machine
+
+- CPU:
+- GPU:
+- GPU memory:
+- System memory:
+- Windows version:
+- Renderer resolution: 1920 x 1080
+- Build configuration for measurements: Release
+
+## Dataset
+
+- Source: Natural Resources Canada, CanElevation
+- File: ON_GreatLakes_20180621_NAD83CSRS_UTMz17_1km_E6310_N47790_CQL1_CLASS.copc.laz
+- Format: COPC LAZ, LAS 1.4, point format 6
+- Compressed file size: approximately 23 MB
+- Point count: 3,307,391
+- Coordinate system: NAD83(CSRS) / UTM zone 17N
+- EPSG: 2958
+- X range: 631753.610 to 631999.989
+- Y range: 4779000.000 to 4779999.990
+- Z range: 50.140 to 236.700
+- Approximate footprint: 246 m x 1,000 m
+- RGB colour: unavailable
+
+## Initial Rendering Test
+
+- Load the complete tile before rendering
+- Draw every loaded point every frame
+- No culling
+- No level of detail
+- No streaming
+- Target: 60 FPS
+- Frame budget: 16.67 ms
+
+## Measurements
+
+- Dataset point count
+- Loaded point count
+- Drawn point count
+- CPU frame time
+- GPU frame time
+- FPS
+- Point-buffer memory
+- File loading time

@@ -1,0 +1,35 @@
+# Visual Studio and local editor state
+.vs/
+.vscode/
+*.user
+*.suo
+
+# CMake and build output
+out/
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Compiled output
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+
+# Local point-cloud datasets
+test-tiles/
+*.las
+*.laz
+
+# Local archives and scratch files
+*.zip
+*.7z
+*.rar
+
+# Operating-system files
+Thumbs.db
+.DS_Store
