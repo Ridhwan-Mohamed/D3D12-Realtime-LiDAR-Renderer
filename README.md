@@ -121,4 +121,4 @@ These limitations define the next development steps: asynchronous CPU loading, n
 
 ## Dataset note
 
-The screenshots use Canadian public LiDAR data. Dataset files are not redistributed in this repository. See the project documentation in [`docs/`](docs/) for the current research and stress-test notes.
+The screenshots use Canadian public LiDAR data. Dataset files are not redistributed in this repository.

@@ -25,6 +25,9 @@ test-tiles/
 *.las
 *.laz
 
+# Private project notes
+docs/
+
 # Local archives and scratch files
 *.zip
 *.7z
