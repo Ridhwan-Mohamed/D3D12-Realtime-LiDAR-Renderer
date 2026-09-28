@@ -10,6 +10,7 @@
 #include <cmath>
 #include <limits>
 #include <string_view>
+#include <stop_token>
 
 namespace
 {
@@ -45,6 +46,16 @@ namespace
             ThrowLaszipError(
                 reader,
                 operation);
+        }
+    }
+
+    void ThrowIfLoadCancelled(
+        std::stop_token cancellationToken)
+    {
+        if (cancellationToken.stop_requested())
+        {
+            throw std::runtime_error(
+                "Point-cloud loading was cancelled.");
         }
     }
 
@@ -623,7 +634,8 @@ LasPointCloudLoader::Load(
 PointCloudData
 LasPointCloudLoader::Load(
     const PointCloudMetadata& metadata,
-    const Double3& localOrigin)
+    const Double3& localOrigin,
+    std::stop_token cancellationToken)
 {
     if (!std::isfinite(localOrigin.x)
         || !std::isfinite(localOrigin.y)
@@ -633,6 +645,9 @@ LasPointCloudLoader::Load(
             "Point-cloud local origin "
             "must be finite.");
     }
+
+    ThrowIfLoadCancelled(
+        cancellationToken);
 
     PointCloudData data{};
 
@@ -652,9 +667,6 @@ LasPointCloudLoader::Load(
 
     laszip_point* sourcePoint =
         reader.GetPoint();
-
-    const Bounds3d& sourceBounds =
-        data.metadata.sourceBounds;
 
     const std::size_t pointCount =
         static_cast<std::size_t>(
@@ -684,10 +696,19 @@ LasPointCloudLoader::Load(
         -largestFloat
     };
 
+    constexpr std::size_t
+        CancellationCheckInterval = 4'096;
+
     for (std::size_t index = 0;
         index < pointCount;
         ++index)
     {
+        if (index % CancellationCheckInterval == 0)
+        {
+            ThrowIfLoadCancelled(
+                cancellationToken);
+        }
+
         reader.ReadPoint();
 
         // LAS stores integer XYZ values. The header's scale and
@@ -779,6 +800,9 @@ LasPointCloudLoader::Load(
                 data.localBoundsMaximum.z,
                 localZ);
     }
+
+    ThrowIfLoadCancelled(
+        cancellationToken);
 
     if (data.points.empty())
     {

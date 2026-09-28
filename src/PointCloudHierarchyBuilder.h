@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <span>
+#include <stop_token>
 
 struct PointHierarchyBuildSettings
 {
@@ -26,4 +27,5 @@ PointCloudHierarchy BuildPointCloudHierarchy(
     std::span<const GpuPoint> sourcePoints,
     const DirectX::XMFLOAT3& boundsMinimum,
     const DirectX::XMFLOAT3& boundsMaximum,
-    const PointHierarchyBuildSettings& settings = {});
+    const PointHierarchyBuildSettings& settings = {},
+    std::stop_token cancellationToken = {});

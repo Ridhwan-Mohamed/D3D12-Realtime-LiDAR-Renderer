@@ -117,6 +117,8 @@ add_executable(PointCloudRenderer WIN32
     src/PointCloudDataset.cpp
     src/PointCloudDataset.h
     src/Win32Helpers.h
+    src/TileLoadWorker.h
+    src/TileLoadWorker.cpp
 )
 
 target_sources(

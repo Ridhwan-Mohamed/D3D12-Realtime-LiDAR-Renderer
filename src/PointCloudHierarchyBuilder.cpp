@@ -17,8 +17,23 @@ namespace
 
         PointHierarchyBuildSettings settings;
 
+        std::stop_token cancellationToken;
+
         PointCloudHierarchy hierarchy;
     };
+
+    constexpr std::size_t
+        CancellationCheckInterval = 4'096;
+
+    void ThrowIfHierarchyBuildCancelled(
+        const BuildContext& context)
+    {
+        if (context.cancellationToken.stop_requested())
+        {
+            throw std::runtime_error(
+                "Point-cloud hierarchy build was cancelled.");
+        }
+    }
 
     bool BoundsAreValid(
         const DirectX::XMFLOAT3& minimum,
@@ -191,9 +206,20 @@ namespace
         node.sourcePoints =
             node.representativePoints;
 
-        for (const std::uint32_t pointIndex :
-        pointIndices)
+        for (std::size_t localIndex = 0;
+            localIndex < pointIndices.size();
+            ++localIndex)
         {
+            if (localIndex
+                % CancellationCheckInterval == 0)
+            {
+                ThrowIfHierarchyBuildCancelled(
+                    context);
+            }
+
+            const std::uint32_t pointIndex =
+                pointIndices[localIndex];
+
             context.hierarchy.points.push_back(
                 context.sourcePoints[pointIndex]);
         }
@@ -206,6 +232,10 @@ namespace
         const DirectX::XMFLOAT3& boundsMaximum,
         std::uint32_t depth)
     {
+
+        ThrowIfHierarchyBuildCancelled(
+            context);
+
         const PointHierarchyNodeIndex nodeIndex =
             AddNode(
                 context,
@@ -251,9 +281,20 @@ namespace
         std::array<std::size_t, 8>
             childPointCounts{};
 
-        for (const std::uint32_t pointIndex :
-        pointIndices)
+        for (std::size_t position = 0;
+            position < pointIndices.size();
+            ++position)
         {
+            if (position
+                % CancellationCheckInterval == 0)
+            {
+                ThrowIfHierarchyBuildCancelled(
+                    context);
+            }
+
+            const std::uint32_t pointIndex =
+                pointIndices[position];
+
             const std::uint32_t octant =
                 FindOctant(
                     context.sourcePoints[
@@ -271,9 +312,20 @@ namespace
                 childPointCounts[octant]);
         }
 
-        for (const std::uint32_t pointIndex :
-        pointIndices)
+        for (std::size_t position = 0;
+            position < pointIndices.size();
+            ++position)
         {
+            if (position
+                % CancellationCheckInterval == 0)
+            {
+                ThrowIfHierarchyBuildCancelled(
+                    context);
+            }
+
+            const std::uint32_t pointIndex =
+                pointIndices[position];
+
             const std::uint32_t octant =
                 FindOctant(
                     context.sourcePoints[
@@ -375,8 +427,11 @@ namespace
     }
 
     void ValidateHierarchy(
-        const PointCloudHierarchy& hierarchy)
+        const BuildContext& context)
     {
+        const PointCloudHierarchy& hierarchy =
+            context.hierarchy;
+
         if (hierarchy.rootIndex
             >= hierarchy.nodes.size())
         {
@@ -386,9 +441,16 @@ namespace
 
         std::uint64_t packedLeafPointCount = 0;
 
-        for (const PointHierarchyNode& node :
-            hierarchy.nodes)
+        for (std::size_t nodeIndex = 0;
+            nodeIndex < hierarchy.nodes.size();
+            ++nodeIndex)
         {
+            ThrowIfHierarchyBuildCancelled(
+                context);
+
+            const PointHierarchyNode& node =
+                hierarchy.nodes[nodeIndex];
+
             for (const PointHierarchyNodeIndex child :
             node.children)
             {
@@ -498,14 +560,25 @@ namespace
     }
 
     void GenerateRepresentativePoints(
-        PointCloudHierarchy& hierarchy,
-        std::uint32_t maximumPointsPerNode)
+        BuildContext& context)
     {
+        PointCloudHierarchy& hierarchy =
+            context.hierarchy;
+
+        const std::uint32_t maximumPointsPerNode =
+            context.settings.
+            maximumRepresentativePointsPerNode;
         // BuildNode packed every original point first.
         // New representative samples are appended afterward.
-        for (PointHierarchyNode& node :
-            hierarchy.nodes)
+        for (std::size_t nodeIndex = 0;
+            nodeIndex < hierarchy.nodes.size();
+            ++nodeIndex)
         {
+            ThrowIfHierarchyBuildCancelled(
+                context);
+
+            PointHierarchyNode& node =
+                hierarchy.nodes[nodeIndex];
             if (node.IsLeaf())
             {
                 node.spacing =
@@ -550,6 +623,13 @@ namespace
                 sampleIndex < sampleCount;
                 ++sampleIndex)
             {
+                if (sampleIndex
+                    % CancellationCheckInterval == 0)
+                {
+                    ThrowIfHierarchyBuildCancelled(
+                        context);
+                }
+
                 const std::uint64_t sourceOffset =
                     static_cast<std::uint64_t>(
                         sampleIndex)
@@ -582,7 +662,8 @@ PointCloudHierarchy BuildPointCloudHierarchy(
     std::span<const GpuPoint> sourcePoints,
     const DirectX::XMFLOAT3& boundsMinimum,
     const DirectX::XMFLOAT3& boundsMaximum,
-    const PointHierarchyBuildSettings& settings)
+    const PointHierarchyBuildSettings& settings,
+    std::stop_token cancellationToken)
 {
     if (sourcePoints.empty())
     {
@@ -629,8 +710,12 @@ PointCloudHierarchy BuildPointCloudHierarchy(
 
     BuildContext context{
         sourcePoints,
-        settings
+        settings,
+        cancellationToken
     };
+
+    ThrowIfHierarchyBuildCancelled(
+        context);
 
     context.hierarchy.sourcePointCount =
         sourcePoints.size();
@@ -638,13 +723,27 @@ PointCloudHierarchy BuildPointCloudHierarchy(
     context.hierarchy.points.reserve(
         sourcePoints.size());
 
-    std::vector<std::uint32_t> rootPointIndices(
+    std::vector<std::uint32_t>
+        rootPointIndices;
+
+    rootPointIndices.reserve(
         sourcePoints.size());
 
-    std::iota(
-        rootPointIndices.begin(),
-        rootPointIndices.end(),
-        std::uint32_t{ 0 });
+    for (std::size_t pointIndex = 0;
+        pointIndex < sourcePoints.size();
+        ++pointIndex)
+    {
+        if (pointIndex
+            % CancellationCheckInterval == 0)
+        {
+            ThrowIfHierarchyBuildCancelled(
+                context);
+        }
+
+        rootPointIndices.push_back(
+            static_cast<std::uint32_t>(
+                pointIndex));
+    }
 
     context.hierarchy.rootIndex =
         BuildNode(
@@ -655,11 +754,10 @@ PointCloudHierarchy BuildPointCloudHierarchy(
             0);
 
     GenerateRepresentativePoints(
-        context.hierarchy,
-        settings.maximumRepresentativePointsPerNode);
+        context);
 
     ValidateHierarchy(
-        context.hierarchy);
+        context);
 
     return std::move(
         context.hierarchy);

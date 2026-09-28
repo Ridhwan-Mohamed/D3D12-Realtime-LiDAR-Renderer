@@ -48,6 +48,30 @@ public:
         std::uint32_t initialDrawPointCount);
 
     [[nodiscard]]
+    PointCloudTileId BeginPointCloudTileUpload(
+        std::span<const GpuPoint> points,
+        std::uint32_t initialDrawPointCount);
+
+    [[nodiscard]]
+    bool IsPointCloudTileUploadComplete(
+        PointCloudTileId tileId) const;
+
+    [[nodiscard]]
+    bool FinalizePointCloudTileUpload(
+        PointCloudTileId tileId);
+
+    [[nodiscard]]
+    bool AbandonPointCloudTileUpload(
+        PointCloudTileId tileId);
+
+    [[nodiscard]]
+    std::size_t
+        GetPendingPointCloudUploadCount() const noexcept
+    {
+        return pendingPointTileUploads_.size();
+    }
+
+    [[nodiscard]]
     bool SetPointCloudTileDrawRanges(
         PointCloudTileId tileId,
         std::span<
@@ -139,6 +163,8 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource>
             pointBuffer;
 
+        bool needsCopyToVertexTransition = false;
+
         D3D12_VERTEX_BUFFER_VIEW
             pointBufferView{};
 
@@ -151,7 +177,25 @@ private:
         std::uint64_t sizeBytes = 0;
         PointCloudTileId id = 0;
     };
+    struct PendingPointTileUpload
+    {
+        GpuPointTile tile;
 
+        Microsoft::WRL::ComPtr<ID3D12Resource>
+            uploadBuffer;
+
+        Microsoft::WRL::ComPtr<
+            ID3D12CommandAllocator>
+            commandAllocator;
+
+        Microsoft::WRL::ComPtr<
+            ID3D12GraphicsCommandList>
+            commandList;
+
+        bool abandoned = false;
+
+        std::uint64_t copyFenceValue = 0;
+    };
     struct RetiredPointTile
     {
         PointCloudTileId id = 0;
@@ -164,6 +208,7 @@ private:
         std::uint64_t releaseFenceValue = 0;
     };
 
+    void CollectAbandonedPointUploads();
     void CollectRetiredPointTiles();
 
     std::vector<RetiredPointTile>
@@ -184,6 +229,8 @@ private:
     void CreateGraphicsPipeline();
     void CreateCommandObjects();
     void CreateFence();
+    void CreateCopyQueue();
+    void CreateCopyFence();
     void CreateBackBufferViews();
     void CreateDepthResources(
         std::uint32_t width,
@@ -201,32 +248,41 @@ private:
     void SignalFrame(FrameResource& frame);
     void WaitForGpu();
     void WaitForFenceValue(std::uint64_t fenceValue);
+    void WaitForCopyFenceValue(std::uint64_t fenceValue);
+    void WaitForPendingPointUploads();
+    void RecordPointTileUploadTransitions();
 
     Microsoft::WRL::ComPtr<IDXGIFactory7> factory_;
     Microsoft::WRL::ComPtr<IDXGIAdapter4> adapter_;
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> commandQueue_;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> copyQueue_;
     Microsoft::WRL::ComPtr<IDXGISwapChain4> swapChain_;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rtvHeap_;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, FrameCount> backBuffers_;
     std::array<FrameResource, FrameCount> frameResources_;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList_;
     Microsoft::WRL::ComPtr<ID3D12Fence> fence_;
+    Microsoft::WRL::ComPtr<ID3D12Fence> copyFence_;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pipelineState_;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> dsvHeap_;
     Microsoft::WRL::ComPtr<ID3D12Resource> depthBuffer_;
 
     std::vector<GpuPointTile> pointTiles_;
+    std::vector<PendingPointTileUpload> pendingPointTileUploads_;
     std::uint64_t pointCount_ = 0;
 
     D3D12_VIEWPORT viewport_{};
     D3D12_RECT scissorRectangle_{};
 
     HANDLE fenceEvent_ = nullptr;
+    std::uint64_t nextFenceValue_ = 1;
+    //Copy queue and fence
+    HANDLE copyFenceEvent_ = nullptr;
+    std::uint64_t nextCopyFenceValue_ = 1;
 
     std::uint32_t rtvDescriptorSize_ = 0;
-    std::uint64_t nextFenceValue_ = 1;
     std::uint32_t frameIndex_ = 0;
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;

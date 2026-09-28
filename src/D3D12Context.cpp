@@ -59,6 +59,7 @@ void D3D12Context::Initialize(
     CreateDevice();
     ConfigureValidation();
     CreateCommandQueue();
+    CreateCopyQueue();
     CreateSwapChain(window, width, height);
     CreateRenderTargets();
     CreateDepthResources(width, height);
@@ -67,6 +68,7 @@ void D3D12Context::Initialize(
     CreateCommandObjects();
     CreateGpuTimingResources();
     CreateFence();
+    CreateCopyFence();
 
     width_ = width;
     height_ = height;
@@ -225,6 +227,31 @@ void D3D12Context::CreateCommandQueue()
 
     commandQueue_->SetName(
         L"Main Direct Command Queue");
+}
+
+void D3D12Context::CreateCopyQueue()
+{
+    D3D12_COMMAND_QUEUE_DESC description{};
+
+    description.Type =
+        D3D12_COMMAND_LIST_TYPE_COPY;
+
+    description.Priority =
+        D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+
+    description.Flags =
+        D3D12_COMMAND_QUEUE_FLAG_NONE;
+
+    description.NodeMask = 0;
+
+    ThrowIfFailed(
+        device_->CreateCommandQueue(
+            &description,
+            IID_PPV_ARGS(&copyQueue_)),
+        "Create copy command queue");
+
+    copyQueue_->SetName(
+        L"Point Cloud Copy Queue");
 }
 
 void D3D12Context::CreateSwapChain(
@@ -931,6 +958,32 @@ void D3D12Context::CreateFence()
     }
 }
 
+void D3D12Context::CreateCopyFence()
+{
+    ThrowIfFailed(
+        device_->CreateFence(
+            0,
+            D3D12_FENCE_FLAG_NONE,
+            IID_PPV_ARGS(&copyFence_)),
+        "Create copy fence");
+
+    copyFence_->SetName(
+        L"Point Cloud Copy Fence");
+
+    copyFenceEvent_ = CreateEventW(
+        nullptr,
+        FALSE,
+        FALSE,
+        nullptr);
+
+    if (copyFenceEvent_ == nullptr)
+    {
+        ThrowIfFailed(
+            HRESULT_FROM_WIN32(GetLastError()),
+            "Create copy fence event");
+    }
+}
+
 void D3D12Context::ReadGpuTimingResult(
     FrameResource& frame)
 {
@@ -1067,6 +1120,91 @@ void D3D12Context::WaitForFenceValue(
     }
 }
 
+void D3D12Context::WaitForCopyFenceValue(
+    std::uint64_t fenceValue)
+{
+    if (fenceValue == 0
+        || copyFence_->GetCompletedValue()
+        >= fenceValue)
+    {
+        return;
+    }
+
+    ThrowIfFailed(
+        copyFence_->SetEventOnCompletion(
+            fenceValue,
+            copyFenceEvent_),
+        "Set copy fence completion event");
+
+    const DWORD waitResult =
+        WaitForSingleObject(
+            copyFenceEvent_,
+            INFINITE);
+
+    if (waitResult == WAIT_FAILED)
+    {
+        ThrowIfFailed(
+            HRESULT_FROM_WIN32(GetLastError()),
+            "Wait for copy fence event");
+    }
+}
+
+void D3D12Context::WaitForPendingPointUploads()
+{
+    std::uint64_t latestFenceValue = 0;
+
+    for (const PendingPointTileUpload& upload :
+        pendingPointTileUploads_)
+    {
+        latestFenceValue = std::max(
+            latestFenceValue,
+            upload.copyFenceValue);
+    }
+
+    if (latestFenceValue != 0)
+    {
+        WaitForCopyFenceValue(
+            latestFenceValue);
+    }
+}
+
+void D3D12Context::RecordPointTileUploadTransitions()
+{
+    for (GpuPointTile& tile :
+        pointTiles_)
+    {
+        if (!tile.needsCopyToVertexTransition
+            || !tile.pointBuffer)
+        {
+            continue;
+        }
+
+        D3D12_RESOURCE_BARRIER barrier{};
+
+        barrier.Type =
+            D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+
+        barrier.Transition.pResource =
+            tile.pointBuffer.Get();
+
+        barrier.Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+        barrier.Transition.StateBefore =
+            D3D12_RESOURCE_STATE_COPY_DEST;
+
+        barrier.Transition.StateAfter =
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+
+        commandList_->ResourceBarrier(
+            1,
+            &barrier);
+
+        tile.needsCopyToVertexTransition =
+            false;
+    }
+}
+
 void D3D12Context::Render(const Camera& camera)
 {
     if (!initialized_
@@ -1076,6 +1214,7 @@ void D3D12Context::Render(const Camera& camera)
         return;
     }
 
+    CollectAbandonedPointUploads();
     CollectRetiredPointTiles();
 
     FrameResource& currentFrame =
@@ -1132,6 +1271,8 @@ void D3D12Context::Render(const Camera& camera)
         gpuTimestampQueryHeap_.Get(),
         D3D12_QUERY_TYPE_TIMESTAMP,
         timestampStartIndex);
+
+    RecordPointTileUploadTransitions();
 
     commandList_->RSSetViewports(
         1,
@@ -1505,6 +1646,333 @@ PointCloudTileId D3D12Context::AddPointCloudTile(
     return tileId;
 }
 
+PointCloudTileId
+D3D12Context::BeginPointCloudTileUpload(
+    std::span<const GpuPoint> points,
+    std::uint32_t initialDrawPointCount)
+{
+    if (!initialized_)
+    {
+        throw std::logic_error(
+            "D3D12 must be initialized before loading points.");
+    }
+
+    if (points.empty())
+    {
+        throw std::invalid_argument(
+            "Cannot create an empty GPU point tile.");
+    }
+
+    if (initialDrawPointCount == 0
+        || initialDrawPointCount > points.size())
+    {
+        throw std::invalid_argument(
+            "Initial point draw count is invalid.");
+    }
+
+    const std::uint64_t dataSize =
+        points.size_bytes();
+
+    if (dataSize
+        > std::numeric_limits<UINT>::max())
+    {
+        throw std::runtime_error(
+            "Point buffer exceeds the D3D12 "
+            "vertex-view size limit.");
+    }
+
+    if (dataSize
+        > std::numeric_limits<std::uint64_t>::max()
+        - pointBufferSizeBytes_)
+    {
+        throw std::overflow_error(
+            "Point-memory counter overflow.");
+    }
+
+    PendingPointTileUpload upload{};
+
+    GpuPointTile& tile =
+        upload.tile;
+
+    tile.id =
+        nextPointCloudTileId_++;
+
+    tile.pointBuffer =
+        CreateBuffer(
+            dataSize,
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+
+    const std::wstring tileName =
+        L"Point Cloud Tile "
+        + std::to_wstring(tile.id);
+
+    tile.pointBuffer->SetName(
+        tileName.c_str());
+
+    upload.uploadBuffer =
+        CreateBuffer(
+            dataSize,
+            D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_RESOURCE_STATE_GENERIC_READ);
+
+    const std::wstring uploadName =
+        L"Point Cloud Upload Buffer "
+        + std::to_wstring(tile.id);
+
+    upload.uploadBuffer->SetName(
+        uploadName.c_str());
+
+    void* mappedData = nullptr;
+
+    D3D12_RANGE noCpuReads{
+        0,
+        0
+    };
+
+    ThrowIfFailed(
+        upload.uploadBuffer->Map(
+            0,
+            &noCpuReads,
+            &mappedData),
+        "Map asynchronous point upload buffer");
+
+    std::memcpy(
+        mappedData,
+        points.data(),
+        dataSize);
+
+    D3D12_RANGE writtenRange{
+        0,
+        static_cast<SIZE_T>(dataSize)
+    };
+
+    upload.uploadBuffer->Unmap(
+        0,
+        &writtenRange);
+
+    ThrowIfFailed(
+        device_->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_COPY,
+            IID_PPV_ARGS(
+                &upload.commandAllocator)),
+        "Create point upload command allocator");
+
+    ThrowIfFailed(
+        device_->CreateCommandList(
+            0,
+            D3D12_COMMAND_LIST_TYPE_COPY,
+            upload.commandAllocator.Get(),
+            nullptr,
+            IID_PPV_ARGS(
+                &upload.commandList)),
+        "Create point upload command list");
+
+    upload.commandList->CopyBufferRegion(
+        tile.pointBuffer.Get(),
+        0,
+        upload.uploadBuffer.Get(),
+        0,
+        dataSize);
+
+    ThrowIfFailed(
+        upload.commandList->Close(),
+        "Close point upload command list");
+
+    tile.pointBufferView.BufferLocation =
+        tile.pointBuffer->GetGPUVirtualAddress();
+
+    tile.pointBufferView.SizeInBytes =
+        static_cast<UINT>(dataSize);
+
+    tile.pointBufferView.StrideInBytes =
+        sizeof(GpuPoint);
+
+    tile.uploadedPointCount =
+        static_cast<std::uint32_t>(
+            points.size());
+
+    tile.drawRanges.push_back({
+        0,
+        initialDrawPointCount
+        });
+
+    tile.selectedPointCount =
+        initialDrawPointCount;
+
+    tile.sizeBytes =
+        dataSize;
+
+    tile.needsCopyToVertexTransition =
+        true;
+
+    const PointCloudTileId tileId =
+        tile.id;
+
+    // Store the resources before submitting the work.
+    // They must remain alive until the copy finishes.
+    pendingPointTileUploads_.push_back(
+        std::move(upload));
+
+    PendingPointTileUpload& submittedUpload =
+        pendingPointTileUploads_.back();
+
+    ID3D12CommandList* commandLists[]{
+        submittedUpload.commandList.Get()
+    };
+
+    copyQueue_->ExecuteCommandLists(
+        1,
+        commandLists);
+
+    const std::uint64_t fenceValue =
+        nextCopyFenceValue_++;
+
+    ThrowIfFailed(
+        copyQueue_->Signal(
+            copyFence_.Get(),
+            fenceValue),
+        "Signal point upload copy fence");
+
+    submittedUpload.copyFenceValue =
+        fenceValue;
+
+    // Count the default GPU buffer immediately because
+    // the allocation already exists while copying.
+    pointBufferSizeBytes_ +=
+        dataSize;
+
+    return tileId;
+}
+
+bool D3D12Context::IsPointCloudTileUploadComplete(
+    PointCloudTileId tileId) const
+{
+    if (tileId == 0
+        || !copyFence_)
+    {
+        return false;
+    }
+
+    const auto uploadIterator =
+        std::find_if(
+            pendingPointTileUploads_.begin(),
+            pendingPointTileUploads_.end(),
+            [tileId](
+                const PendingPointTileUpload& upload)
+            {
+                return upload.tile.id == tileId;
+            });
+
+    if (uploadIterator
+        == pendingPointTileUploads_.end())
+    {
+        return false;
+    }
+
+    if (uploadIterator->abandoned
+        || uploadIterator->copyFenceValue == 0)
+    {
+        return false;
+    }
+
+    return copyFence_->GetCompletedValue()
+        >= uploadIterator->copyFenceValue;
+}
+
+bool D3D12Context::FinalizePointCloudTileUpload(
+    PointCloudTileId tileId)
+{
+    if (!initialized_)
+    {
+        throw std::logic_error(
+            "D3D12 must be initialized before "
+            "finalizing point uploads.");
+    }
+
+    const auto uploadIterator =
+        std::find_if(
+            pendingPointTileUploads_.begin(),
+            pendingPointTileUploads_.end(),
+            [tileId](
+                const PendingPointTileUpload& upload)
+            {
+                return upload.tile.id == tileId;
+            });
+
+    if (uploadIterator
+        == pendingPointTileUploads_.end())
+    {
+        return false;
+    }
+
+    if (uploadIterator->abandoned
+        || uploadIterator->copyFenceValue == 0
+        || copyFence_->GetCompletedValue()
+        < uploadIterator->copyFenceValue)
+    {
+        return false;
+    }
+
+    const std::uint64_t selectedPointCount =
+        uploadIterator->tile.selectedPointCount;
+
+    if (selectedPointCount
+        > std::numeric_limits<std::uint64_t>::max()
+        - pointCount_)
+    {
+        throw std::overflow_error(
+            "Resident point-count overflow.");
+    }
+
+    // Allocate before moving the tile. If allocation fails,
+    // the pending upload remains intact.
+    pointTiles_.reserve(
+        pointTiles_.size() + 1);
+
+    pointTiles_.push_back(
+        std::move(uploadIterator->tile));
+
+    pointCount_ +=
+        selectedPointCount;
+
+    pendingPointTileUploads_.erase(
+        uploadIterator);
+
+    return true;
+}
+
+bool D3D12Context::AbandonPointCloudTileUpload(
+    PointCloudTileId tileId)
+{
+    if (!initialized_)
+    {
+        throw std::logic_error(
+            "D3D12 must be initialized before "
+            "abandoning point uploads.");
+    }
+
+    const auto uploadIterator =
+        std::find_if(
+            pendingPointTileUploads_.begin(),
+            pendingPointTileUploads_.end(),
+            [tileId](
+                const PendingPointTileUpload& upload)
+            {
+                return upload.tile.id == tileId;
+            });
+
+    if (uploadIterator
+        == pendingPointTileUploads_.end())
+    {
+        return false;
+    }
+
+    uploadIterator->abandoned = true;
+
+    return true;
+}
+
 bool D3D12Context::SetPointCloudTileDrawRanges(
     PointCloudTileId tileId,
     std::span<
@@ -1672,6 +2140,51 @@ bool D3D12Context::RemovePointCloudTile(
     return true;
 }
 
+void D3D12Context::CollectAbandonedPointUploads()
+{
+    if (pendingPointTileUploads_.empty()
+        || !copyFence_)
+    {
+        return;
+    }
+
+    const std::uint64_t completedFenceValue =
+        copyFence_->GetCompletedValue();
+
+    const auto firstRemainingUpload =
+        std::remove_if(
+            pendingPointTileUploads_.begin(),
+            pendingPointTileUploads_.end(),
+            [this, completedFenceValue](
+                const PendingPointTileUpload& upload)
+            {
+                if (!upload.abandoned
+                    || upload.copyFenceValue == 0
+                    || upload.copyFenceValue
+                        > completedFenceValue)
+                {
+                    return false;
+                }
+
+                if (upload.tile.sizeBytes
+                    > pointBufferSizeBytes_)
+                {
+                    throw std::logic_error(
+                        "Abandoned point-upload memory "
+                        "accounting underflow.");
+                }
+
+                pointBufferSizeBytes_ -=
+                    upload.tile.sizeBytes;
+
+                return true;
+            });
+
+    pendingPointTileUploads_.erase(
+        firstRemainingUpload,
+        pendingPointTileUploads_.end());
+}
+
 void D3D12Context::CollectRetiredPointTiles()
 {
     if (retiredPointTiles_.empty()
@@ -1716,9 +2229,11 @@ void D3D12Context::ClearPointCloudTiles()
             "clearing point-cloud tiles.");
     }
 
+    WaitForPendingPointUploads();
     WaitForGpu();
 
     pointTiles_.clear();
+    pendingPointTileUploads_.clear();
     retiredPointTiles_.clear();
 
     pointCount_ = 0;
@@ -1782,6 +2297,7 @@ void D3D12Context::Shutdown() noexcept
     {
         try
         {
+            WaitForPendingPointUploads();
             WaitForGpu();
         }
         catch (...)
@@ -1798,6 +2314,12 @@ void D3D12Context::Shutdown() noexcept
         fenceEvent_ = nullptr;
     }
 
+    if (copyFenceEvent_ != nullptr)
+    {
+        CloseHandle(copyFenceEvent_);
+        copyFenceEvent_ = nullptr;
+    }
+
     for (auto& backBuffer : backBuffers_)
     {
         backBuffer.Reset();
@@ -1806,6 +2328,7 @@ void D3D12Context::Shutdown() noexcept
     depthBuffer_.Reset();
 
     pointTiles_.clear();
+    pendingPointTileUploads_.clear();
     retiredPointTiles_.clear();
     pointCount_ = 0;
     pointBufferSizeBytes_ = 0;
@@ -1844,10 +2367,13 @@ void D3D12Context::Shutdown() noexcept
     rootSignature_.Reset();
 
     fence_.Reset();
+    copyFence_.Reset();
     dsvHeap_.Reset();
     rtvHeap_.Reset();
     swapChain_.Reset();
+    copyQueue_.Reset();
     commandQueue_.Reset();
+
     device_.Reset();
     adapter_.Reset();
     factory_.Reset();

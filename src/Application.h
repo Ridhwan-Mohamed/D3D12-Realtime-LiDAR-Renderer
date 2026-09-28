@@ -4,6 +4,7 @@
 #include "Camera.h"
 #include "PointCloudDataset.h"
 #include "PointCloudHierarchy.h"
+#include "TileLoadWorker.h"
 
 #include <Windows.h>
 #include <cstdint>
@@ -12,6 +13,8 @@
 #include <string>
 #include <vector>
 #include <queue>
+#include <stop_token>
+
 
 class Application
 {
@@ -37,6 +40,17 @@ public:
     void UpdateCamera(float deltaSeconds);
 
 private:
+    enum class TileLifecycleState : std::uint8_t
+    {
+        Unloaded,
+        Queued,
+        Loading,
+        ReadyForUpload,
+        Uploading,
+        Resident,
+        Retiring
+    };
+
     struct TileResidencyState
     {
         std::size_t metadataIndex = 0;
@@ -53,10 +67,19 @@ private:
 
         bool wanted = false;
 
+        float unwantedSeconds = 0.0f;
+
+        TileLifecycleState lifecycleState =
+            TileLifecycleState::Unloaded;
+
+        std::uint64_t requestGeneration = 0;
+
+        std::stop_source loadStopSource;
+
         [[nodiscard]]
         bool IsResident() const noexcept
         {
-            return gpuTileId.has_value();
+            return lifecycleState == TileLifecycleState::Resident;
         }
 
         PointCloudHierarchy hierarchy;
@@ -76,6 +99,34 @@ private:
 
     std::vector<TileResidencyState>
         tileResidencyStates_;
+
+    [[nodiscard]]
+    static bool CanTransitionTileState(
+        TileLifecycleState currentState,
+        TileLifecycleState nextState) noexcept;
+
+    static void TransitionTileState(
+        TileResidencyState& state,
+        TileLifecycleState nextState);
+
+    [[nodiscard]]
+    static const char* GetTileLifecycleStateName(
+        TileLifecycleState state) noexcept;
+
+    static void ValidateTileLifecycleState(
+        const TileResidencyState& state);
+
+    [[nodiscard]]
+    static std::uint64_t BeginTileRequest(
+        TileResidencyState& state);
+
+    static void InvalidateTileRequest(
+        TileResidencyState& state);
+
+    [[nodiscard]]
+    static bool IsCurrentTileRequest(
+        const TileResidencyState& state,
+        std::uint64_t requestGeneration) noexcept;
 
     static constexpr std::uint64_t
         PointMemoryBudgetBytes =
@@ -101,6 +152,10 @@ private:
 
     D3D12Context graphics_;
 
+    TileLoadWorker tileLoadWorker_{
+        2
+    };
+
     Camera camera_{
     1600.0f / 900.0f
     };
@@ -119,6 +174,8 @@ private:
 
     void UpdateFrameStatistics(
         double frameSeconds);
+    void UpdateTileStabilityTimers(
+        float deltaSeconds);
     std::wstring windowTitlePrefix_;
     double frameTimeAccumulator_ = 0.0;
     std::uint32_t measuredFrameCount_ = 0;
@@ -147,12 +204,22 @@ private:
     // Tiling and LOD loading.
     void UpdateTilePriorities();
     void UpdateTileResidency(float deltaSeconds);
+    void ProcessTileLoadStartedEvents();
+    void ProcessOneCompletedTileLoad();
+    void ProcessCompletedPointUploads();
+    void CancelUnwantedCpuTileRequests();
+    void CancelUnwantedPointUploads();
+    [[nodiscard]]
+    bool TryQueueNextTileLoad();
     void ValidateTileResidency() const;
     void UpdatePointDetailSelection();
     std::vector<std::size_t> tilePriorityOrder_;
     std::size_t wantedTileCount_ = 0;
     std::uint64_t wantedPointBytes_ = 0;
     double residencyUpdateAccumulator_ = 1.0;
+    static constexpr float TileUnwantedGraceSeconds = 0.75f;
+    static constexpr std::size_t MaximumConcurrentCpuTileRequests = 1;
+    static constexpr std::size_t MaximumConcurrentPointUploads = 1;
     static constexpr float RefinePointSpacingPixels = 2.2f;
     static constexpr float CoarsenPointSpacingPixels = 1.8f;
     static constexpr std::uint64_t MaximumDrawnPoints = 2'000'000;

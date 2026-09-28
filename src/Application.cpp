@@ -1,8 +1,6 @@
 #include "Application.h"
 
 #include "Win32Helpers.h"
-#include "LasPointCloudLoader.h"
-#include "PointCloudHierarchyBuilder.h"
 
 #include <cstdlib>
 #include <exception>
@@ -18,6 +16,7 @@
 #include <numeric>
 #include <DirectXCollision.h>
 #include <queue>
+#include <stop_token>
 
 namespace
 {
@@ -291,6 +290,8 @@ int Application::Run(int showCommand)
             dataset.localBoundsMaximum.y);
 
         FramePointCloud();
+
+        tileLoadWorker_.Start();
     }
 
     SetWindowTextW(
@@ -359,6 +360,8 @@ int Application::Run(int showCommand)
         }
     }
 
+    tileLoadWorker_.Stop();
+
     graphics_.Shutdown();
 
     return static_cast<int>(message.wParam);
@@ -404,6 +407,212 @@ void Application::FramePointCloud()
             1.0f);
 }
 
+bool Application::CanTransitionTileState(
+    TileLifecycleState currentState,
+    TileLifecycleState nextState) noexcept
+{
+    switch (currentState)
+    {
+    case TileLifecycleState::Unloaded:
+        return
+            nextState == TileLifecycleState::Queued
+            || nextState == TileLifecycleState::Loading;
+
+    case TileLifecycleState::Queued:
+        return
+            nextState == TileLifecycleState::Loading
+            || nextState == TileLifecycleState::Unloaded;
+
+    case TileLifecycleState::Loading:
+        return
+            nextState == TileLifecycleState::ReadyForUpload
+            || nextState == TileLifecycleState::Unloaded;
+
+    case TileLifecycleState::ReadyForUpload:
+        return
+            nextState == TileLifecycleState::Uploading
+            || nextState == TileLifecycleState::Unloaded;
+
+    case TileLifecycleState::Uploading:
+        return
+            nextState == TileLifecycleState::Resident
+            || nextState == TileLifecycleState::Retiring;
+
+    case TileLifecycleState::Resident:
+        return
+            nextState == TileLifecycleState::Retiring;
+
+    case TileLifecycleState::Retiring:
+        return
+            nextState == TileLifecycleState::Unloaded;
+    }
+
+    return false;
+}
+
+void Application::TransitionTileState(
+    TileResidencyState& state,
+    TileLifecycleState nextState)
+{
+    if (!CanTransitionTileState(
+        state.lifecycleState,
+        nextState))
+    {
+        throw std::logic_error(
+            std::string(
+                "Invalid tile lifecycle transition: ")
+            + GetTileLifecycleStateName(
+                state.lifecycleState)
+            + " -> "
+            + GetTileLifecycleStateName(
+                nextState));
+    }
+
+    state.lifecycleState =
+        nextState;
+
+    ValidateTileLifecycleState(state);
+}
+
+const char*
+Application::GetTileLifecycleStateName(
+    TileLifecycleState state) noexcept
+{
+    switch (state)
+    {
+    case TileLifecycleState::Unloaded:
+        return "Unloaded";
+
+    case TileLifecycleState::Queued:
+        return "Queued";
+
+    case TileLifecycleState::Loading:
+        return "Loading";
+
+    case TileLifecycleState::ReadyForUpload:
+        return "ReadyForUpload";
+
+    case TileLifecycleState::Uploading:
+        return "Uploading";
+
+    case TileLifecycleState::Resident:
+        return "Resident";
+
+    case TileLifecycleState::Retiring:
+        return "Retiring";
+    }
+
+    return "Unknown";
+}
+
+void Application::ValidateTileLifecycleState(
+    const TileResidencyState& state)
+{
+    const bool hasGpuTile =
+        state.gpuTileId.has_value();
+
+    const bool hasHierarchy =
+        !state.hierarchy.Empty();
+
+    switch (state.lifecycleState)
+    {
+    case TileLifecycleState::Unloaded:
+    case TileLifecycleState::Queued:
+    case TileLifecycleState::Loading:
+    case TileLifecycleState::ReadyForUpload:
+        if (hasGpuTile || hasHierarchy)
+        {
+            throw std::logic_error(
+                "Nonresident tile unexpectedly owns "
+                "resident rendering resources.");
+        }
+
+        break;
+
+    case TileLifecycleState::Uploading:
+        if (!hasGpuTile || !hasHierarchy)
+        {
+            throw std::logic_error(
+                "Uploading tile is missing its pending "
+                "GPU tile or hierarchy.");
+        }
+        break;
+    case TileLifecycleState::Resident:
+    case TileLifecycleState::Retiring:
+        if (!hasGpuTile || !hasHierarchy)
+        {
+            throw std::logic_error(
+                "Resident tile is missing its GPU tile "
+                "or hierarchy.");
+        }
+
+        break;
+    }
+}
+
+std::uint64_t Application::BeginTileRequest(
+    TileResidencyState& state)
+{
+    if (state.lifecycleState
+        != TileLifecycleState::Unloaded)
+    {
+        throw std::logic_error(
+            "Tile request began while tile was not unloaded.");
+    }
+
+    if (state.requestGeneration
+        == std::numeric_limits<std::uint64_t>::max())
+    {
+        throw std::overflow_error(
+            "Tile request generation overflow.");
+    }
+
+    state.loadStopSource =
+        std::stop_source{};
+
+    ++state.requestGeneration;
+
+    return state.requestGeneration;
+}
+
+void Application::InvalidateTileRequest(
+    TileResidencyState& state)
+{
+    if (state.lifecycleState
+        != TileLifecycleState::Queued
+        && state.lifecycleState
+        != TileLifecycleState::Loading)
+    {
+        throw std::logic_error(
+            "Only queued or loading tile requests "
+            "can be invalidated.");
+    }
+
+    if (state.requestGeneration
+        == std::numeric_limits<std::uint64_t>::max())
+    {
+        throw std::overflow_error(
+            "Tile request generation overflow.");
+    }
+
+    ++state.requestGeneration;
+
+    state.loadStopSource.request_stop();
+
+    TransitionTileState(
+        state,
+        TileLifecycleState::Unloaded);
+}
+
+bool Application::IsCurrentTileRequest(
+    const TileResidencyState& state,
+    std::uint64_t requestGeneration) noexcept
+{
+    return
+        state.requestGeneration
+        == requestGeneration;
+}
+
 void Application::UpdateTilePriorities()
 {
     if (!pointCloudDataset_
@@ -436,7 +645,8 @@ void Application::UpdateTilePriorities()
             std::size_t leftIndex,
             std::size_t rightIndex)
         {
-            constexpr float residentBiasSquared = 0.64f;
+            constexpr float activeBiasSquared =
+                0.64f;
 
             const TileResidencyState& left =
                 tileResidencyStates_[leftIndex];
@@ -444,16 +654,24 @@ void Application::UpdateTilePriorities()
             const TileResidencyState& right =
                 tileResidencyStates_[rightIndex];
 
+            const bool leftIsActive =
+                left.lifecycleState
+                != TileLifecycleState::Unloaded;
+
+            const bool rightIsActive =
+                right.lifecycleState
+                != TileLifecycleState::Unloaded;
+
             const float leftPriority =
                 left.cameraDistanceSquared
-                * (left.IsResident()
-                    ? residentBiasSquared
+                * (leftIsActive
+                    ? activeBiasSquared
                     : 1.0f);
 
             const float rightPriority =
                 right.cameraDistanceSquared
-                * (right.IsResident()
-                    ? residentBiasSquared
+                * (rightIsActive
+                    ? activeBiasSquared
                     : 1.0f);
 
             if (leftPriority != rightPriority)
@@ -498,61 +716,415 @@ void Application::UpdateTilePriorities()
     }
 }
 
-void Application::UpdateTileResidency(
+void Application::UpdateTileStabilityTimers(
     float deltaSeconds)
 {
-    if (!pointCloudDataset_)
-    {
-        return;
-    }
-
-    residencyUpdateAccumulator_ +=
-        static_cast<double>(deltaSeconds);
-
-    if (residencyUpdateAccumulator_
-        < ResidencyUpdateIntervalSeconds)
-    {
-        return;
-    }
-
-    residencyUpdateAccumulator_ = 0.0;
-
-    const PointCloudDatasetInfo& dataset =
-        *pointCloudDataset_;
-
-    // First remove active tiles that are no longer wanted.
     for (TileResidencyState& state :
         tileResidencyStates_)
     {
-        if (!state.IsResident()
-            || state.wanted)
+        if (state.wanted)
+        {
+            state.unwantedSeconds = 0.0f;
+            continue;
+        }
+
+        state.unwantedSeconds =
+            std::min(
+                state.unwantedSeconds
+                + deltaSeconds,
+                TileUnwantedGraceSeconds);
+    }
+}
+
+void Application::ProcessTileLoadStartedEvents()
+{
+    while (true)
+    {
+        std::optional<TileLoadStarted> started =
+            tileLoadWorker_.TryTakeStarted();
+
+        if (!started)
+        {
+            return;
+        }
+
+        if (started->tileStateIndex
+            >= tileResidencyStates_.size())
+        {
+            throw std::logic_error(
+                "Tile worker returned an invalid "
+                "tile-state index.");
+        }
+
+        TileResidencyState& state =
+            tileResidencyStates_[
+                started->tileStateIndex];
+
+        if (!IsCurrentTileRequest(
+            state,
+            started->requestGeneration))
+        {
+            // A future cancellation may make an event stale.
+            continue;
+        }
+
+        if (state.lifecycleState
+            != TileLifecycleState::Queued)
+        {
+            throw std::logic_error(
+                "Current tile request started while "
+                "the tile was not queued.");
+        }
+
+        TransitionTileState(
+            state,
+            TileLifecycleState::Loading);
+    }
+}
+
+void Application::CancelUnwantedCpuTileRequests()
+{
+    for (std::size_t stateIndex = 0;
+        stateIndex < tileResidencyStates_.size();
+        ++stateIndex)
+    {
+        TileResidencyState& state =
+            tileResidencyStates_[stateIndex];
+
+        if (state.wanted
+            || state.unwantedSeconds
+            < TileUnwantedGraceSeconds)
         {
             continue;
+        }
+
+        if (state.lifecycleState
+            == TileLifecycleState::Queued)
+        {
+            const bool removedFromQueue =
+                tileLoadWorker_.TryCancelPending(
+                    stateIndex,
+                    state.requestGeneration);
+
+            if (removedFromQueue)
+            {
+                OutputDebugStringW(
+                    L"Cancelled queued tile load.\n");
+            }
+
+            InvalidateTileRequest(state);
+        }
+        else if (state.lifecycleState
+            == TileLifecycleState::Loading)
+        {
+            // LASzip loading is not cooperatively
+            // interruptible yet. Incrementing the generation
+            // ensures its eventual result is discarded.
+            InvalidateTileRequest(state);
+
+            OutputDebugStringW(
+                L"Invalidated active tile load.\n");
+        }
+    }
+}
+
+void Application::CancelUnwantedPointUploads()
+{
+    for (TileResidencyState& state :
+        tileResidencyStates_)
+    {
+        if (state.wanted
+            || state.unwantedSeconds
+            < TileUnwantedGraceSeconds
+            || state.lifecycleState
+            != TileLifecycleState::Uploading)
+        {
+            continue;
+        }
+
+        if (!state.gpuTileId)
+        {
+            throw std::logic_error(
+                "Uploading tile has no GPU tile ID.");
         }
 
         const PointCloudTileId tileId =
             *state.gpuTileId;
 
-        const bool removed =
-            graphics_.RemovePointCloudTile(
+        TransitionTileState(
+            state,
+            TileLifecycleState::Retiring);
+
+        const bool abandoned =
+            graphics_.AbandonPointCloudTileUpload(
                 tileId);
 
-        if (!removed)
+        if (!abandoned)
         {
             throw std::logic_error(
-                "Application residency state "
-                "does not match the renderer.");
+                "Application tried to abandon an "
+                "unknown point upload.");
         }
 
         state.gpuTileId.reset();
-        state.hierarchy = PointCloudHierarchy{};
+
+        state.hierarchy =
+            PointCloudHierarchy{};
+
         state.selectedNodeFlags.clear();
         state.refinedNodeFlags.clear();
         state.nextRefinedNodeFlags.clear();
         state.selectedDrawRanges.clear();
+
+        TransitionTileState(
+            state,
+            TileLifecycleState::Unloaded);
+
+        OutputDebugStringW(
+            L"Abandoned unwanted GPU tile upload.\n");
+    }
+}
+
+void Application::ProcessOneCompletedTileLoad()
+{
+    if (graphics_.GetPendingPointCloudUploadCount()
+        >= MaximumConcurrentPointUploads)
+    {
+        return;
     }
 
-    // Load at most one wanted tile per update.
+    std::optional<TileLoadResult> completed =
+        tileLoadWorker_.TryTakeCompleted();
+
+    if (!completed)
+    {
+        return;
+    }
+
+    if (completed->tileStateIndex
+        >= tileResidencyStates_.size())
+    {
+        throw std::logic_error(
+            "Tile worker completed an invalid "
+            "tile-state index.");
+    }
+
+    TileResidencyState& state =
+        tileResidencyStates_[
+            completed->tileStateIndex];
+
+    if (!IsCurrentTileRequest(
+        state,
+        completed->requestGeneration))
+    {
+        // Destroying the result releases its CPU hierarchy.
+        return;
+    }
+
+    if (state.lifecycleState
+        != TileLifecycleState::Loading)
+    {
+        throw std::logic_error(
+            "Current tile request completed while "
+            "the tile was not loading.");
+    }
+
+    if (!completed->Succeeded())
+    {
+        TransitionTileState(
+            state,
+            TileLifecycleState::Unloaded);
+
+        std::rethrow_exception(
+            completed->failure);
+    }
+
+    TransitionTileState(
+        state,
+        TileLifecycleState::ReadyForUpload);
+
+    PointCloudHierarchy& hierarchy =
+        completed->hierarchy;
+
+    const PointCloudDatasetInfo& dataset =
+        *pointCloudDataset_;
+
+    const PointCloudMetadata& metadata =
+        dataset.tileMetadata[
+            state.metadataIndex];
+
+    const std::uint64_t actualBytes =
+        static_cast<std::uint64_t>(
+            hierarchy.points.size())
+        * sizeof(GpuPoint);
+
+    const std::uint64_t sourceBytes =
+        metadata.pointCount
+        * sizeof(GpuPoint);
+
+    if (actualBytes < sourceBytes)
+    {
+        throw std::runtime_error(
+            "Hierarchy contains fewer points "
+            "than the source tile.");
+    }
+
+    state.requiredGpuBytes =
+        actualBytes;
+
+    if (!state.wanted)
+    {
+        TransitionTileState(
+            state,
+            TileLifecycleState::Unloaded);
+
+        return;
+    }
+
+    const std::uint64_t allocatedBytes =
+        graphics_.GetPointBufferSizeBytes();
+
+    const bool hierarchyFitsBudget =
+        actualBytes <= PointMemoryBudgetBytes
+        && allocatedBytes
+        <= PointMemoryBudgetBytes
+        - actualBytes;
+
+    if (!hierarchyFitsBudget)
+    {
+        OutputDebugStringW(
+            L"Prepared hierarchy does not currently "
+            L"fit the point-memory budget.\n");
+
+        TransitionTileState(
+            state,
+            TileLifecycleState::Unloaded);
+
+        return;
+    }
+
+    const std::wstring message =
+        L"Uploading prepared tile: "
+        + metadata.sourcePath.filename().wstring()
+        + L"\n";
+
+    OutputDebugStringW(
+        message.c_str());
+
+    const std::size_t hierarchyNodeCount =
+        hierarchy.nodes.size();
+
+    state.gpuTileId =
+        graphics_.BeginPointCloudTileUpload(
+            hierarchy.points,
+            static_cast<std::uint32_t>(
+                hierarchy.sourcePointCount));
+
+    // BeginPointCloudTileUpload copied the points into its
+    // persistent upload buffer. The worker's CPU point array
+    // is no longer needed.
+    hierarchy.points =
+        std::vector<GpuPoint>{};
+
+    state.hierarchy =
+        std::move(hierarchy);
+
+    TransitionTileState(
+        state,
+        TileLifecycleState::Uploading);
+
+    OutputDebugStringW(
+        (
+            L"Hierarchy nodes: "
+            + std::to_wstring(
+                hierarchyNodeCount)
+            + L"\n"
+            ).c_str());
+}
+
+void Application::ProcessCompletedPointUploads()
+{
+    for (TileResidencyState& state :
+        tileResidencyStates_)
+    {
+        if (state.lifecycleState
+            != TileLifecycleState::Uploading)
+        {
+            continue;
+        }
+
+        if (!state.gpuTileId)
+        {
+            throw std::logic_error(
+                "Uploading tile has no GPU tile ID.");
+        }
+
+        const PointCloudTileId tileId =
+            *state.gpuTileId;
+
+        if (!graphics_.
+            IsPointCloudTileUploadComplete(
+                tileId))
+        {
+            continue;
+        }
+
+        const bool finalized =
+            graphics_.FinalizePointCloudTileUpload(
+                tileId);
+
+        if (!finalized)
+        {
+            throw std::logic_error(
+                "Completed point upload could not "
+                "be finalized.");
+        }
+
+        TransitionTileState(
+            state,
+            TileLifecycleState::Resident);
+
+        const PointCloudMetadata& metadata =
+            pointCloudDataset_->tileMetadata[
+                state.metadataIndex];
+
+        const std::wstring message =
+            L"Point tile became resident: "
+            + metadata.sourcePath.filename().wstring()
+            + L"\n";
+
+        OutputDebugStringW(
+            message.c_str());
+    }
+}
+
+bool Application::TryQueueNextTileLoad()
+{
+    std::size_t activeCpuRequestCount = 0;
+
+    for (const TileResidencyState& state :
+        tileResidencyStates_)
+    {
+        if (state.lifecycleState
+            == TileLifecycleState::Queued
+            || state.lifecycleState
+            == TileLifecycleState::Loading
+            || state.lifecycleState
+            == TileLifecycleState::ReadyForUpload)
+        {
+            ++activeCpuRequestCount;
+        }
+    }
+
+    if (activeCpuRequestCount
+        >= MaximumConcurrentCpuTileRequests)
+    {
+        return false;
+    }
+
+    const PointCloudDatasetInfo& dataset =
+        *pointCloudDataset_;
+
     for (const std::size_t stateIndex :
     tilePriorityOrder_)
     {
@@ -561,14 +1133,14 @@ void Application::UpdateTileResidency(
                 stateIndex];
 
         if (!state.wanted
-            || state.IsResident())
+            || state.lifecycleState
+            != TileLifecycleState::Unloaded)
         {
             continue;
         }
 
         const std::uint64_t allocatedBytes =
-            graphics_.
-            GetPointBufferSizeBytes();
+            graphics_.GetPointBufferSizeBytes();
 
         const bool memoryAvailable =
             state.requiredGpuBytes
@@ -582,94 +1154,135 @@ void Application::UpdateTileResidency(
             continue;
         }
 
+        const std::uint64_t requestGeneration =
+            BeginTileRequest(state);
+
         const PointCloudMetadata& metadata =
             dataset.tileMetadata[
                 state.metadataIndex];
 
-        PointCloudData tile =
-            LasPointCloudLoader::Load(
-                metadata,
-                dataset.localOrigin);
+        TileLoadRequest request{};
 
-        PointCloudHierarchy hierarchy =
-            BuildPointCloudHierarchy(
-                tile.points,
-                tile.localBoundsMinimum,
-                tile.localBoundsMaximum);
+        request.tileStateIndex =
+            stateIndex;
 
-        const std::uint64_t actualBytes =
-            static_cast<std::uint64_t>(
-                hierarchy.points.size())
-            * sizeof(GpuPoint);
+        request.requestGeneration =
+            requestGeneration;
 
-        const std::uint64_t sourceBytes =
-            metadata.pointCount
-            * sizeof(GpuPoint);
+        request.metadata =
+            metadata;
 
-        if (actualBytes < sourceBytes)
+        request.localOrigin =
+            dataset.localOrigin;
+
+        request.cancellationSource =
+            state.loadStopSource;
+
+        TransitionTileState(
+            state,
+            TileLifecycleState::Queued);
+
+        const bool queued =
+            tileLoadWorker_.TryEnqueue(
+                std::move(request));
+
+        if (!queued)
         {
-            throw std::runtime_error(
-                "Hierarchy contains fewer points "
-                "than the source tile.");
+            TransitionTileState(
+                state,
+                TileLifecycleState::Unloaded);
+
+            return false;
         }
 
-        state.requiredGpuBytes =
-            actualBytes;
+        return true;
+    }
 
-        const std::uint64_t currentAllocatedBytes =
-            graphics_.GetPointBufferSizeBytes();
+    return false;
+}
 
-        const bool hierarchyFitsBudget =
-            actualBytes <= PointMemoryBudgetBytes
-            && currentAllocatedBytes
-            <= PointMemoryBudgetBytes
-            - actualBytes;
-
-        if (!hierarchyFitsBudget)
-        {
-            OutputDebugStringW(
-                L"Hierarchy does not currently fit "
-                L"the point-memory budget.\n");
-
-            continue;
-        }
-
-        const std::wstring message =
-            L"Loading resident tile: "
-            + metadata.sourcePath.filename().wstring()
-            + L"\n";
-
-        OutputDebugStringW(
-            message.c_str());
-
-        state.gpuTileId =
-            graphics_.AddPointCloudTile(
-                hierarchy.points,
-                static_cast<std::uint32_t>(
-                    hierarchy.sourcePointCount));
-
-        const std::size_t hierarchyNodeCount =
-            hierarchy.nodes.size();
-
-        // The GPU now owns its copy of the packed points.
-        // Keep the lightweight node metadata on the CPU.
-        hierarchy.points =
-            std::vector<GpuPoint>{};
-
-        state.hierarchy =
-            std::move(hierarchy);
-
-        OutputDebugStringW(
-            (
-                L"Hierarchy nodes: "
-                + std::to_wstring(
-                    hierarchyNodeCount)
-                + L"\n"
-                ).c_str());
-
-        // Only one decode/upload per update.
-        ValidateTileResidency();
+void Application::UpdateTileResidency(
+    float deltaSeconds)
+{
+    if (!pointCloudDataset_)
+    {
         return;
+    }
+
+    // Process lightweight CPU and GPU completion
+    // notifications every frame.
+    ProcessTileLoadStartedEvents();
+    UpdateTileStabilityTimers(deltaSeconds);
+    CancelUnwantedCpuTileRequests();
+    CancelUnwantedPointUploads();
+    ProcessCompletedPointUploads();
+
+    residencyUpdateAccumulator_ +=
+        static_cast<double>(deltaSeconds);
+
+    const bool performResidencyUpdate =
+        residencyUpdateAccumulator_
+        >= ResidencyUpdateIntervalSeconds;
+
+    if (performResidencyUpdate)
+    {
+        residencyUpdateAccumulator_ = 0.0;
+
+        // Remove resident tiles that are no longer wanted.
+        for (TileResidencyState& state :
+            tileResidencyStates_)
+        {
+            if (!state.IsResident()
+                || state.wanted
+                || state.unwantedSeconds
+                < TileUnwantedGraceSeconds)
+            {
+                continue;
+            }
+
+            const PointCloudTileId tileId =
+                *state.gpuTileId;
+
+            TransitionTileState(
+                state,
+                TileLifecycleState::Retiring);
+
+            const bool removed =
+                graphics_.RemovePointCloudTile(
+                    tileId);
+
+            if (!removed)
+            {
+                throw std::logic_error(
+                    "Application residency state "
+                    "does not match the renderer.");
+            }
+
+            state.gpuTileId.reset();
+            state.hierarchy =
+                PointCloudHierarchy{};
+
+            state.selectedNodeFlags.clear();
+            state.refinedNodeFlags.clear();
+            state.nextRefinedNodeFlags.clear();
+            state.selectedDrawRanges.clear();
+
+            TransitionTileState(
+                state,
+                TileLifecycleState::Unloaded);
+        }
+    }
+
+    // Accept CPU work every frame instead of waiting for
+    // the 0.25-second residency interval.
+    ProcessOneCompletedTileLoad();
+
+    if (performResidencyUpdate)
+    {
+        const bool queued =
+            TryQueueNextTileLoad();
+
+        (void)queued;
     }
 
     ValidateTileResidency();
@@ -691,6 +1304,8 @@ void Application::ValidateTileResidency() const
     for (const TileResidencyState& state :
         tileResidencyStates_)
     {
+        ValidateTileLifecycleState(state);
+
         if (state.IsResident())
         {
             ++applicationResidentCount;

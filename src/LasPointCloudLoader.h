@@ -1,7 +1,7 @@
 #pragma once
 
 #include "PointCloudData.h"
-
+#include <stop_token>
 #include <filesystem>
 
 class LasPointCloudLoader
@@ -18,5 +18,6 @@ public:
     [[nodiscard]]
     static PointCloudData Load(
         const PointCloudMetadata& metadata,
-        const Double3& localOrigin);
+        const Double3& localOrigin,
+        std::stop_token cancellationToken = {});
 };
