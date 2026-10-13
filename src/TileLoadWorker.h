@@ -50,6 +50,57 @@ struct TileLoadResult
     }
 };
 
+struct ClodBuildRequest
+{
+    std::size_t tileStateIndex = 0;
+
+    std::uint64_t requestGeneration = 0;
+
+    // Contains the complete packed discrete point array.
+    //
+    // The first sourcePointCount records contain every
+    // original point exactly once. Remaining records are
+    // discrete hierarchy representatives.
+    std::vector<GpuPoint> discretePoints;
+
+    std::uint64_t sourcePointCount = 0;
+
+    DirectX::XMFLOAT3 boundsMinimum{};
+    DirectX::XMFLOAT3 boundsMaximum{};
+
+    std::stop_source cancellationSource;
+};
+
+struct ClodBuildResult
+{
+    std::size_t tileStateIndex = 0;
+
+    std::uint64_t requestGeneration = 0;
+
+    // Return ownership of the discrete array so the
+    // application can upload it after CLOD finishes.
+    //
+    // In a later part the discrete upload will happen before
+    // this job, so this return path will become unnecessary.
+    std::vector<GpuPoint> discretePoints;
+
+    std::vector<ClodPoint> clodPoints;
+
+    std::vector<PointRange> clodLevelRanges;
+
+    float clodRootSpacing = 0.0f;
+
+    std::uint64_t sourcePointCount = 0;
+
+    std::exception_ptr failure;
+
+    [[nodiscard]]
+    bool Succeeded() const noexcept
+    {
+        return failure == nullptr;
+    }
+};
+
 class TileLoadWorker final
 {
 public:
@@ -79,6 +130,19 @@ public:
         TileLoadRequest request);
 
     [[nodiscard]]
+    bool TryEnqueueClodBuild(
+        ClodBuildRequest& request);
+
+    [[nodiscard]]
+    bool TryCancelPendingClodBuild(
+        std::size_t tileStateIndex,
+        std::uint64_t requestGeneration);
+
+    [[nodiscard]]
+    std::optional<ClodBuildResult>
+        TryTakeCompletedClodBuild();
+
+    [[nodiscard]]
     bool TryCancelPending(
         std::size_t tileStateIndex,
         std::uint64_t requestGeneration);
@@ -102,6 +166,10 @@ private:
     static TileLoadResult ProcessRequest(
         const TileLoadRequest& request);
 
+    [[nodiscard]]
+    static ClodBuildResult ProcessClodBuild(
+        ClodBuildRequest request);
+
     const std::size_t
         maximumPendingRequests_;
 
@@ -118,6 +186,12 @@ private:
 
     std::deque<TileLoadResult>
         completedResults_;
+
+    std::deque<ClodBuildRequest>
+        pendingClodBuildRequests_;
+
+    std::deque<ClodBuildResult>
+        completedClodBuildResults_;
 
     bool acceptingRequests_ = false;
 

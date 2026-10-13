@@ -11,9 +11,129 @@
 #include <limits>
 #include <string_view>
 #include <stop_token>
+#include <fstream>
 
 namespace
 {
+    void ValidateCompressedFileExtent(
+        const std::filesystem::path& path)
+    {
+        constexpr std::streamoff
+            PointDataOffsetFieldOffset = 96;
+
+        constexpr std::streamoff
+            PointFormatFieldOffset = 104;
+
+        constexpr std::uint8_t
+            CompressedPointFormatFlag = 0x80;
+
+        const std::uintmax_t fileSize =
+            std::filesystem::file_size(path);
+
+        if (fileSize < 112)
+        {
+            throw std::runtime_error(
+                "Point cloud file is too small to contain "
+                "a valid LAS header: "
+                + path.string());
+        }
+
+        std::ifstream stream(
+            path,
+            std::ios::binary);
+
+        if (!stream)
+        {
+            throw std::runtime_error(
+                "Could not open point cloud for validation: "
+                + path.string());
+        }
+
+        std::uint32_t pointDataOffset = 0;
+        std::uint8_t rawPointFormat = 0;
+
+        stream.seekg(PointDataOffsetFieldOffset);
+        stream.read(
+            reinterpret_cast<char*>(
+                &pointDataOffset),
+            sizeof(pointDataOffset));
+
+        stream.seekg(PointFormatFieldOffset);
+        stream.read(
+            reinterpret_cast<char*>(
+                &rawPointFormat),
+            sizeof(rawPointFormat));
+
+        if (!stream)
+        {
+            throw std::runtime_error(
+                "Could not read the LAS header while "
+                "validating the point cloud: "
+                + path.string());
+        }
+
+        if ((rawPointFormat
+            & CompressedPointFormatFlag) == 0)
+        {
+            return;
+        }
+
+        if (pointDataOffset
+            > fileSize - sizeof(std::int64_t))
+        {
+            throw std::runtime_error(
+                "Compressed point data begins beyond the "
+                "end of the file. The LAZ file appears "
+                "incomplete: "
+                + path.string());
+        }
+
+        std::int64_t chunkTableOffset = 0;
+
+        stream.seekg(
+            static_cast<std::streamoff>(
+                pointDataOffset));
+
+        stream.read(
+            reinterpret_cast<char*>(
+                &chunkTableOffset),
+            sizeof(chunkTableOffset));
+
+        if (!stream)
+        {
+            throw std::runtime_error(
+                "Could not read the LAZ chunk-table "
+                "location: "
+                + path.string());
+        }
+
+        // A value of -1 means the real location is stored
+        // in the final eight bytes of the file.
+        if (chunkTableOffset == -1)
+        {
+            stream.seekg(
+                static_cast<std::streamoff>(
+                    fileSize - sizeof(std::int64_t)));
+
+            stream.read(
+                reinterpret_cast<char*>(
+                    &chunkTableOffset),
+                sizeof(chunkTableOffset));
+        }
+
+        if (!stream
+            || chunkTableOffset < 0
+            || static_cast<std::uint64_t>(
+                chunkTableOffset) >= fileSize)
+        {
+            throw std::runtime_error(
+                "The LAZ chunk table lies beyond the end "
+                "of the file. The download is incomplete "
+                "or the file is corrupt: "
+                + path.string());
+        }
+    }
+
     [[noreturn]]
     void ThrowLaszipError(
         laszip_POINTER reader,
@@ -501,6 +621,11 @@ LasPointCloudLoader::ReadMetadata(
             "Point cloud path is not a regular file: "
             + path.string());
     }
+
+    // LASzip 3.5.0 can access invalid internal memory when
+    // asked to stream a truncated LAZ whose chunk table is
+    // missing. Reject that file before giving it to LASzip.
+    ValidateCompressedFileExtent(path);
 
     LaszipReader reader;
     reader.Open(path);

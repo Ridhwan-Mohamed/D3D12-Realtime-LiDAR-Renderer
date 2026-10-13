@@ -17,6 +17,7 @@
 #include <DirectXCollision.h>
 #include <queue>
 #include <stop_token>
+#include <fstream>
 
 namespace
 {
@@ -25,6 +26,44 @@ namespace
 
     constexpr wchar_t WindowTitle[] =
         L"D3D12 Point Cloud Renderer";
+
+    double CalculatePercentile(
+        const std::vector<double>& sortedSamples,
+        double percentile)
+    {
+        if (sortedSamples.empty())
+        {
+            return 0.0;
+        }
+
+        const double samplePosition =
+            percentile
+            * static_cast<double>(
+                sortedSamples.size() - 1);
+
+        const std::size_t lowerIndex =
+            static_cast<std::size_t>(
+                std::floor(samplePosition));
+
+        const std::size_t upperIndex =
+            std::min(
+                lowerIndex + 1,
+                sortedSamples.size() - 1);
+
+        const double interpolation =
+            samplePosition
+            - static_cast<double>(lowerIndex);
+
+        const double lowerValue =
+            sortedSamples[lowerIndex];
+
+        const double upperValue =
+            sortedSamples[upperIndex];
+
+        return lowerValue
+            + (upperValue - lowerValue)
+            * interpolation;
+    }
 
     float DistanceOutsideInterval(
         float value,
@@ -165,7 +204,9 @@ int Application::Run(int showCommand)
     graphics_.Initialize(
         window_,
         clientWidth_,
-        clientHeight_);
+        clientHeight_,
+        static_cast<std::uint32_t>(
+            MaximumDrawnPoints));
 
     windowTitlePrefix_ =
         std::wstring(WindowTitle)
@@ -193,9 +234,14 @@ int Application::Run(int showCommand)
             const PointCloudMetadata& metadata =
                 dataset.tileMetadata[index];
 
+            constexpr std::uint64_t
+                MinimumGpuBytesPerSourcePoint =
+                sizeof(GpuPoint)
+                + sizeof(ClodPoint);
+
             if (metadata.pointCount
             > std::numeric_limits<std::uint64_t>::max()
-                / sizeof(GpuPoint))
+                / MinimumGpuBytesPerSourcePoint)
             {
                 throw std::overflow_error(
                     "Tile GPU memory estimate overflow.");
@@ -205,9 +251,16 @@ int Application::Run(int showCommand)
 
             state.metadataIndex = index;
 
+            // This is a lower-bound estimate:
+            //
+            // - one original discrete point
+            // - one original CLOD point
+            //
+            // Internal discrete representative copies are not known
+            // until the CPU hierarchy has been constructed.
             state.requiredGpuBytes =
                 metadata.pointCount
-                * sizeof(GpuPoint);
+                * MinimumGpuBytesPerSourcePoint;
 
             const Bounds3d& sourceBounds =
                 metadata.sourceBounds;
@@ -323,10 +376,13 @@ int Application::Run(int showCommand)
             const auto currentTime =
                 std::chrono::steady_clock::now();
 
+            const double frameSeconds =
+                std::chrono::duration<double>(
+                    currentTime - previousTime).count();
+
             const float deltaSeconds =
                 std::min(
-                    std::chrono::duration<float>(
-                        currentTime - previousTime).count(),
+                    static_cast<float>(frameSeconds),
                     0.1f);
 
             previousTime = currentTime;
@@ -335,19 +391,27 @@ int Application::Run(int showCommand)
 
             UpdateTilePriorities();
             UpdateTileResidency(deltaSeconds);
-            UpdatePointDetailSelection();
 
-            const auto renderStart =
-                std::chrono::steady_clock::now();
+            // Keep the discrete fallback current while CLOD is
+            // preparing, but stop paying for CPU hierarchy
+            // traversal once a completed CLOD result is active.
+            if (requestedPointRenderMode_
+                    == PointRenderMode::Discrete
+                || activePointRenderMode_
+                    == PointRenderMode::Discrete)
+            {
+                UpdatePointDetailSelection();
+            }
 
-            graphics_.Render(camera_);
+            graphics_.Render(
+                camera_,
+                requestedPointRenderMode_
+                == PointRenderMode::Continuous);
 
-            const auto renderEnd =
-                std::chrono::steady_clock::now();
-
-            const double frameSeconds =
-                std::chrono::duration<double>(
-                    renderEnd - renderStart).count();
+            activePointRenderMode_ =
+                graphics_.WasClodDrawnLastFrame()
+                ? PointRenderMode::Continuous
+                : PointRenderMode::Discrete;
 
             UpdateBenchmark(frameSeconds);
 
@@ -851,6 +915,11 @@ void Application::CancelUnwantedPointUploads()
         const PointCloudTileId tileId =
             *state.gpuTileId;
 
+        CancelClodWork(
+            static_cast<std::size_t>(
+                &state - tileResidencyStates_.data()),
+            state);
+
         TransitionTileState(
             state,
             TileLifecycleState::Retiring);
@@ -939,10 +1008,6 @@ void Application::ProcessOneCompletedTileLoad()
             completed->failure);
     }
 
-    TransitionTileState(
-        state,
-        TileLifecycleState::ReadyForUpload);
-
     PointCloudHierarchy& hierarchy =
         completed->hierarchy;
 
@@ -953,19 +1018,51 @@ void Application::ProcessOneCompletedTileLoad()
         dataset.tileMetadata[
             state.metadataIndex];
 
-    const std::uint64_t actualBytes =
+    if (hierarchy.sourcePointCount
+        != metadata.pointCount)
+    {
+        throw std::runtime_error(
+            "Hierarchy source count does not match "
+            "the tile metadata.");
+    }
+
+    if (hierarchy.points.size()
+        > std::numeric_limits<std::uint64_t>::max()
+        / sizeof(GpuPoint))
+    {
+        throw std::overflow_error(
+            "Discrete hierarchy byte size overflow.");
+    }
+
+    const std::uint64_t discreteBytes =
         static_cast<std::uint64_t>(
             hierarchy.points.size())
         * sizeof(GpuPoint);
 
-    const std::uint64_t sourceBytes =
+    const std::uint64_t expectedClodBytes =
+        hierarchy.sourcePointCount
+        * sizeof(ClodPoint);
+
+    if (expectedClodBytes
+        > std::numeric_limits<std::uint64_t>::max()
+        - discreteBytes)
+    {
+        throw std::overflow_error(
+            "Combined hierarchy byte size overflow.");
+    }
+
+    const std::uint64_t actualBytes =
+        discreteBytes
+        + expectedClodBytes;
+
+    const std::uint64_t sourceDiscreteBytes =
         metadata.pointCount
         * sizeof(GpuPoint);
 
-    if (actualBytes < sourceBytes)
+    if (discreteBytes < sourceDiscreteBytes)
     {
         throw std::runtime_error(
-            "Hierarchy contains fewer points "
+            "Discrete hierarchy contains fewer points "
             "than the source tile.");
     }
 
@@ -1004,7 +1101,7 @@ void Application::ProcessOneCompletedTileLoad()
     }
 
     const std::wstring message =
-        L"Uploading prepared tile: "
+        L"Uploading discrete tile: "
         + metadata.sourcePath.filename().wstring()
         + L"\n";
 
@@ -1014,20 +1111,25 @@ void Application::ProcessOneCompletedTileLoad()
     const std::size_t hierarchyNodeCount =
         hierarchy.nodes.size();
 
+    TransitionTileState(
+        state,
+        TileLifecycleState::ReadyForUpload);
+
     state.gpuTileId =
         graphics_.BeginPointCloudTileUpload(
             hierarchy.points,
+            {},
             static_cast<std::uint32_t>(
                 hierarchy.sourcePointCount));
 
-    // BeginPointCloudTileUpload copied the points into its
-    // persistent upload buffer. The worker's CPU point array
-    // is no longer needed.
-    hierarchy.points =
-        std::vector<GpuPoint>{};
-
+    // The GPU upload has copied the discrete bytes into its
+    // persistent upload resource. Keep the CPU array briefly
+    // so ownership can move into the CLOD build job.
     state.hierarchy =
         std::move(hierarchy);
+
+    state.clodLifecycleState =
+        ClodLifecycleState::ReadyToBuild;
 
     TransitionTileState(
         state,
@@ -1040,6 +1142,282 @@ void Application::ProcessOneCompletedTileLoad()
                 hierarchyNodeCount)
             + L"\n"
             ).c_str());
+}
+
+void Application::TryStartClodBuilds()
+{
+    for (std::size_t stateIndex = 0;
+        stateIndex < tileResidencyStates_.size();
+        ++stateIndex)
+    {
+        TileResidencyState& state =
+            tileResidencyStates_[stateIndex];
+
+        if (state.clodLifecycleState
+            != ClodLifecycleState::ReadyToBuild)
+        {
+            continue;
+        }
+
+        ClodBuildRequest request{};
+
+        request.tileStateIndex = stateIndex;
+        request.requestGeneration =
+            state.requestGeneration;
+        request.discretePoints =
+            std::move(state.hierarchy.points);
+        request.sourcePointCount =
+            state.hierarchy.sourcePointCount;
+        request.boundsMinimum =
+            state.localBoundsMinimum;
+        request.boundsMaximum =
+            state.localBoundsMaximum;
+        request.cancellationSource =
+            state.loadStopSource;
+
+        const bool queued =
+            tileLoadWorker_.TryEnqueueClodBuild(
+                request);
+
+        if (!queued)
+        {
+            // The reference-based enqueue leaves ownership in
+            // request when the shared worker queue is full.
+            state.hierarchy.points =
+                std::move(request.discretePoints);
+            return;
+        }
+
+        state.clodLifecycleState =
+            ClodLifecycleState::Building;
+
+        OutputDebugStringW(
+            L"Queued asynchronous CLOD build.\n");
+    }
+}
+
+void Application::ProcessCompletedClodBuilds()
+{
+    while (true)
+    {
+        std::optional<ClodBuildResult> completed =
+            tileLoadWorker_.TryTakeCompletedClodBuild();
+
+        if (!completed)
+        {
+            return;
+        }
+
+        if (completed->tileStateIndex
+            >= tileResidencyStates_.size())
+        {
+            throw std::logic_error(
+                "CLOD worker completed an invalid tile index.");
+        }
+
+        TileResidencyState& state =
+            tileResidencyStates_[
+                completed->tileStateIndex];
+
+        if (!IsCurrentTileRequest(
+            state,
+            completed->requestGeneration))
+        {
+            continue;
+        }
+
+        if (state.clodLifecycleState
+            != ClodLifecycleState::Building)
+        {
+            throw std::logic_error(
+                "Current CLOD result arrived while its tile "
+                "was not building CLOD.");
+        }
+
+        // The discrete bytes are already in the renderer's
+        // upload resource. Their temporary CPU copy can go.
+        completed->discretePoints.clear();
+
+        if (!completed->Succeeded())
+        {
+            state.clodLifecycleState =
+                ClodLifecycleState::NotRequested;
+
+            // A failed optional CLOD build must not take down
+            // the already-working discrete renderer.
+            OutputDebugStringW(
+                L"CLOD preparation failed; keeping the "
+                L"discrete tile.\n");
+            continue;
+        }
+
+        if (completed->sourcePointCount
+            != state.hierarchy.sourcePointCount
+            || completed->clodPoints.size()
+                != completed->sourcePointCount)
+        {
+            throw std::logic_error(
+                "Completed CLOD data does not match its "
+                "discrete tile.");
+        }
+
+        std::uint64_t rangedPointCount = 0;
+
+        for (const PointRange& range :
+            completed->clodLevelRanges)
+        {
+            rangedPointCount += range.pointCount;
+        }
+
+        if (rangedPointCount
+            != completed->sourcePointCount)
+        {
+            throw std::logic_error(
+                "CLOD level ranges do not reconstruct "
+                "the source point count.");
+        }
+
+        state.hierarchy.clodPoints =
+            std::move(completed->clodPoints);
+        state.hierarchy.clodLevelRanges =
+            std::move(completed->clodLevelRanges);
+        state.hierarchy.clodRootSpacing =
+            completed->clodRootSpacing;
+        state.clodLifecycleState =
+            ClodLifecycleState::ReadyForUpload;
+
+        OutputDebugStringW(
+            L"CLOD CPU representation is ready.\n");
+    }
+}
+
+void Application::TryStartClodUploads()
+{
+    if (graphics_.GetPendingPointCloudUploadCount()
+        >= MaximumConcurrentPointUploads)
+    {
+        return;
+    }
+
+    for (TileResidencyState& state :
+        tileResidencyStates_)
+    {
+        if (state.clodLifecycleState
+                != ClodLifecycleState::ReadyForUpload
+            || !state.IsResident()
+            || !state.gpuTileId)
+        {
+            continue;
+        }
+
+        const bool started =
+            graphics_.BeginPointCloudTileClodUpload(
+                *state.gpuTileId,
+                state.hierarchy.clodPoints,
+                state.hierarchy.clodRootSpacing);
+
+        if (!started)
+        {
+            throw std::logic_error(
+                "Could not begin CLOD attachment upload.");
+        }
+
+        // BeginPointCloudTileClodUpload copied the bytes to a
+        // persistent upload resource owned by the renderer.
+        state.hierarchy.clodPoints.clear();
+        state.clodLifecycleState =
+            ClodLifecycleState::Uploading;
+
+        OutputDebugStringW(
+            L"Uploading CLOD attachment.\n");
+        return;
+    }
+}
+
+void Application::ProcessCompletedClodUploads()
+{
+    for (TileResidencyState& state :
+        tileResidencyStates_)
+    {
+        if (state.clodLifecycleState
+                != ClodLifecycleState::Uploading
+            || !state.gpuTileId)
+        {
+            continue;
+        }
+
+        if (!graphics_.IsPointCloudTileClodUploadComplete(
+            *state.gpuTileId))
+        {
+            continue;
+        }
+
+        if (!graphics_.FinalizePointCloudTileClodUpload(
+            *state.gpuTileId))
+        {
+            throw std::logic_error(
+                "Completed CLOD attachment could not be "
+                "finalized.");
+        }
+
+        state.clodLifecycleState =
+            ClodLifecycleState::Resident;
+
+        OutputDebugStringW(
+            L"CLOD attachment became resident.\n");
+    }
+}
+
+void Application::CancelClodWork(
+    std::size_t stateIndex,
+    TileResidencyState& state)
+{
+    if (state.clodLifecycleState
+        == ClodLifecycleState::NotRequested)
+    {
+        return;
+    }
+
+    state.loadStopSource.request_stop();
+
+    if (state.clodLifecycleState
+        == ClodLifecycleState::Building)
+    {
+        const bool removed =
+            tileLoadWorker_.TryCancelPendingClodBuild(
+                stateIndex,
+                state.requestGeneration);
+
+        (void)removed;
+    }
+    else if (state.clodLifecycleState
+        == ClodLifecycleState::Uploading)
+    {
+        if (state.gpuTileId)
+        {
+            const bool abandoned =
+                graphics_.AbandonPointCloudTileClodUpload(
+                    *state.gpuTileId);
+
+            (void)abandoned;
+        }
+    }
+
+    state.hierarchy.points.clear();
+    state.hierarchy.clodPoints.clear();
+    state.hierarchy.clodLevelRanges.clear();
+    state.hierarchy.clodRootSpacing = 0.0f;
+    state.clodLifecycleState =
+        ClodLifecycleState::NotRequested;
+
+    if (state.requestGeneration
+        == std::numeric_limits<std::uint64_t>::max())
+    {
+        throw std::overflow_error(
+            "Tile request generation overflow.");
+    }
+
+    ++state.requestGeneration;
 }
 
 void Application::ProcessCompletedPointUploads()
@@ -1212,10 +1590,12 @@ void Application::UpdateTileResidency(
     // Process lightweight CPU and GPU completion
     // notifications every frame.
     ProcessTileLoadStartedEvents();
+    ProcessCompletedClodBuilds();
     UpdateTileStabilityTimers(deltaSeconds);
     CancelUnwantedCpuTileRequests();
     CancelUnwantedPointUploads();
     ProcessCompletedPointUploads();
+    ProcessCompletedClodUploads();
 
     residencyUpdateAccumulator_ +=
         static_cast<double>(deltaSeconds);
@@ -1227,55 +1607,72 @@ void Application::UpdateTileResidency(
     if (performResidencyUpdate)
     {
         residencyUpdateAccumulator_ = 0.0;
+    }
 
-        // Remove resident tiles that are no longer wanted.
-        for (TileResidencyState& state :
-            tileResidencyStates_)
-        {
-            if (!state.IsResident()
-                || state.wanted
-                || state.unwantedSeconds
+    // Check retirement every frame. A tile may become unpinned
+    // immediately after the final chunk of a reduction is
+    // submitted; checking only every 0.25 seconds could let the
+    // next reduction capture the unwanted tile again first.
+    for (TileResidencyState& state :
+        tileResidencyStates_)
+    {
+        if (!state.IsResident()
+            || state.wanted
+            || state.unwantedSeconds
                 < TileUnwantedGraceSeconds)
-            {
-                continue;
-            }
-
-            const PointCloudTileId tileId =
-                *state.gpuTileId;
-
-            TransitionTileState(
-                state,
-                TileLifecycleState::Retiring);
-
-            const bool removed =
-                graphics_.RemovePointCloudTile(
-                    tileId);
-
-            if (!removed)
-            {
-                throw std::logic_error(
-                    "Application residency state "
-                    "does not match the renderer.");
-            }
-
-            state.gpuTileId.reset();
-            state.hierarchy =
-                PointCloudHierarchy{};
-
-            state.selectedNodeFlags.clear();
-            state.refinedNodeFlags.clear();
-            state.nextRefinedNodeFlags.clear();
-            state.selectedDrawRanges.clear();
-
-            TransitionTileState(
-                state,
-                TileLifecycleState::Unloaded);
+        {
+            continue;
         }
+
+        const PointCloudTileId tileId =
+            *state.gpuTileId;
+
+        if (graphics_.
+            IsPointCloudTileReferencedByActiveClodReduction(
+                tileId))
+        {
+            continue;
+        }
+
+        CancelClodWork(
+            static_cast<std::size_t>(
+                &state - tileResidencyStates_.data()),
+            state);
+
+        TransitionTileState(
+            state,
+            TileLifecycleState::Retiring);
+
+        const bool removed =
+            graphics_.RemovePointCloudTile(
+                tileId);
+
+        if (!removed)
+        {
+            throw std::logic_error(
+                "Application residency state "
+                "does not match the renderer.");
+        }
+
+        state.gpuTileId.reset();
+        state.hierarchy =
+            PointCloudHierarchy{};
+
+        state.selectedNodeFlags.clear();
+        state.refinedNodeFlags.clear();
+        state.nextRefinedNodeFlags.clear();
+        state.selectedDrawRanges.clear();
+
+        TransitionTileState(
+            state,
+            TileLifecycleState::Unloaded);
     }
 
     // Accept CPU work every frame instead of waiting for
     // the 0.25-second residency interval.
     ProcessOneCompletedTileLoad();
+    TryStartClodBuilds();
+    TryStartClodUploads();
 
     if (performResidencyUpdate)
     {
@@ -1829,9 +2226,15 @@ void Application::UpdateFrameStatistics(
         static_cast<double>(loadedPointCount)
         / pointsPerMillion;
 
+    const std::uint64_t displayedPointCount =
+        activePointRenderMode_
+        == PointRenderMode::Continuous
+        ? graphics_.GetClodSelectedPointCount()
+        : graphics_.GetPointCount();
+
     const double residentPointMillions =
         static_cast<double>(
-            graphics_.GetPointCount())
+            displayedPointCount)
         / pointsPerMillion;
 
     std::size_t residentTileCount = 0;
@@ -1849,6 +2252,19 @@ void Application::UpdateFrameStatistics(
         static_cast<double>(
             PointMemoryBudgetBytes)
         / bytesPerMebibyte;
+
+    const wchar_t* pointRenderModeName =
+        L"Discrete";
+
+    if (requestedPointRenderMode_
+        == PointRenderMode::Continuous)
+    {
+        pointRenderModeName =
+            activePointRenderMode_
+            == PointRenderMode::Continuous
+            ? L"CLOD"
+            : L"CLOD unavailable - Discrete active";
+    }
 
     const wchar_t* detailModeName =
         fullDetailMode_
@@ -1875,6 +2291,8 @@ void Application::UpdateFrameStatistics(
         << clientWidth_
         << L"x"
         << clientHeight_
+        << L" | Render "
+        << pointRenderModeName
         << L" | "
         << colorModeName
         << L" | Tiles "
@@ -1911,6 +2329,45 @@ void Application::UpdateFrameStatistics(
         << L" | Frame "
         << averageFrameMilliseconds
         << L" ms";
+
+    if (requestedPointRenderMode_
+        == PointRenderMode::Continuous)
+    {
+        title
+            << std::fixed
+            << std::setprecision(3)
+            << L" factor "
+            << graphics_.GetClodFactor();
+
+        const std::uint64_t reductionTotal =
+            graphics_.GetClodReductionTotalPointCount();
+
+        if (reductionTotal != 0)
+        {
+            const double reductionPercent =
+                100.0
+                * static_cast<double>(
+                    graphics_.
+                    GetClodReductionProcessedPointCount())
+                / static_cast<double>(reductionTotal);
+
+            title
+                << std::setprecision(0)
+                << L" build "
+                << reductionPercent
+                << L"%";
+        }
+
+        const std::uint32_t overflowCount =
+            graphics_.GetClodOverflowPointCount();
+
+        if (overflowCount != 0)
+        {
+            title
+                << L" overflow "
+                << overflowCount;
+        }
+    }
 
     if (!fullDetailMode_)
     {
@@ -1983,12 +2440,81 @@ void Application::UpdateCamera(
     detailModeKeyWasDown_ =
         detailModeKeyIsDown;
 
+    const bool pointRenderModeKeyIsDown =
+        (GetAsyncKeyState('C') & 0x8000)
+        != 0;
+
+    if (benchmarkPhase_ == BenchmarkPhase::Idle
+        && pointRenderModeKeyIsDown
+        && !pointRenderModeKeyWasDown_)
+    {
+        if (requestedPointRenderMode_
+            == PointRenderMode::Discrete)
+        {
+            requestedPointRenderMode_ =
+                PointRenderMode::Continuous;
+        }
+        else
+        {
+            requestedPointRenderMode_ =
+                PointRenderMode::Discrete;
+
+            activePointRenderMode_ =
+                PointRenderMode::Discrete;
+        }
+    }
+
+    const bool denserClodKeyIsDown =
+        (GetAsyncKeyState(VK_OEM_4) & 0x8000)
+        != 0;
+
+    const bool sparserClodKeyIsDown =
+        (GetAsyncKeyState(VK_OEM_6) & 0x8000)
+        != 0;
+
+    if (benchmarkPhase_ == BenchmarkPhase::Idle)
+    {
+        constexpr float factorStep = 1.25f;
+        constexpr float minimumFactor = 0.125f;
+        constexpr float maximumFactor = 16.0f;
+
+        if (denserClodKeyIsDown
+            && !denserClodKeyWasDown_)
+        {
+            graphics_.SetClodFactor(
+                std::max(
+                    graphics_.GetClodFactor()
+                    / factorStep,
+                    minimumFactor));
+        }
+
+        if (sparserClodKeyIsDown
+            && !sparserClodKeyWasDown_)
+        {
+            graphics_.SetClodFactor(
+                std::min(
+                    graphics_.GetClodFactor()
+                    * factorStep,
+                    maximumFactor));
+        }
+    }
+
+    denserClodKeyWasDown_ =
+        denserClodKeyIsDown;
+
+    sparserClodKeyWasDown_ =
+        sparserClodKeyIsDown;
+
+    pointRenderModeKeyWasDown_ =
+        pointRenderModeKeyIsDown;
+
     if (benchmarkPhase_
         != BenchmarkPhase::Idle)
     {
         return;
     }
 
+    // Leave the rest of UpdateCamera exactly as it is.
     if (GetAsyncKeyState('1') & 0x8000)
     {
         graphics_.SetPointColorMode(
@@ -2120,6 +2646,11 @@ void Application::UpdateBenchmark(
             benchmarkCpuTimeTotal_ = 0.0;
             benchmarkGpuTimeTotal_ = 0.0;
 
+            benchmarkDrawnPointTotal_ = 0;
+            benchmarkDrawRangeTotal_ = 0;
+
+            benchmarkFrameTimeSamples_.clear();
+
             benchmarkStatusText_ =
                 L"Benchmark: measuring";
         }
@@ -2127,14 +2658,50 @@ void Application::UpdateBenchmark(
         return;
     }
 
-    benchmarkFrameTimeTotal_ +=
+    const double frameMilliseconds =
         frameSeconds * 1000.0;
 
-    benchmarkCpuTimeTotal_ +=
+    const double cpuMilliseconds =
         graphics_.GetCpuRenderMilliseconds();
 
-    benchmarkGpuTimeTotal_ +=
+    const double gpuMilliseconds =
         graphics_.GetGpuFrameMilliseconds();
+
+    benchmarkFrameTimeTotal_ +=
+        frameMilliseconds;
+
+    benchmarkCpuTimeTotal_ +=
+        cpuMilliseconds;
+
+    benchmarkGpuTimeTotal_ +=
+        gpuMilliseconds;
+
+    benchmarkFrameTimeSamples_.push_back(
+        frameMilliseconds);
+
+    const bool benchmarkingClod =
+        benchmarkPointRenderMode_
+        == PointRenderMode::Continuous;
+
+    const std::uint64_t drawnPointCount =
+        benchmarkingClod
+        ? graphics_.GetClodSelectedPointCount()
+        : graphics_.GetPointCount();
+
+    benchmarkDrawnPointTotal_ +=
+        drawnPointCount;
+
+    // CLOD submits one indirect draw. The discrete path submits
+    // one draw for every selected node range.
+    benchmarkDrawRangeTotal_ +=
+        benchmarkingClod
+        ? (drawnPointCount == 0 ? 0u : 1u)
+        : selectedDrawRangeCount_;
+
+    benchmarkOverflowPointCount_ =
+        std::max(
+            benchmarkOverflowPointCount_,
+            graphics_.GetClodOverflowPointCount());
 
     ++benchmarkFrameCount_;
 
@@ -2156,26 +2723,68 @@ void Application::UpdateBenchmark(
         benchmarkGpuTimeTotal_
         / measuredFrames;
 
+    const double averageDrawnPoints =
+        static_cast<double>(
+            benchmarkDrawnPointTotal_)
+        / measuredFrames;
+
+    const double averageDrawRanges =
+        static_cast<double>(
+            benchmarkDrawRangeTotal_)
+        / measuredFrames;
+
     const double averageFramesPerSecond =
         averageFrameMilliseconds > 0.0
         ? 1000.0 / averageFrameMilliseconds
         : 0.0;
+
+    std::vector<double> sortedFrameTimes =
+        benchmarkFrameTimeSamples_;
+
+    std::sort(
+        sortedFrameTimes.begin(),
+        sortedFrameTimes.end());
+
+    const double maximumFrameMilliseconds =
+        sortedFrameTimes.empty()
+        ? 0.0
+        : sortedFrameTimes.back();
+
+    const double frameP95Milliseconds =
+        CalculatePercentile(
+            sortedFrameTimes,
+            0.95);
+
+    const double frameP99Milliseconds =
+        CalculatePercentile(
+            sortedFrameTimes,
+            0.99);
+
+    const wchar_t* benchmarkPointRenderModeName =
+        benchmarkPointRenderMode_
+        == PointRenderMode::Continuous
+        ? L"CLOD"
+        : L"Discrete";
+
+    const wchar_t* benchmarkDetailModeName =
+        benchmarkFullDetailMode_
+        ? L"Full"
+        : L"LOD";
 
     std::wostringstream summary;
 
     summary
         << std::fixed
         << std::setprecision(2)
-        << L"Baseline: Frame "
+        << L"Benchmark ("
+        << benchmarkPointRenderModeName
+        << L"): average "
         << averageFrameMilliseconds
-        << L" ms, CPU "
-        << averageCpuMilliseconds
-        << L" ms, GPU "
-        << averageGpuMilliseconds
-        << L" ms, "
-        << std::setprecision(1)
-        << averageFramesPerSecond
-        << L" FPS";
+        << L" ms, p95 "
+        << frameP95Milliseconds
+        << L" ms, p99 "
+        << frameP99Milliseconds
+        << L" ms";
 
     benchmarkStatusText_ =
         summary.str();
@@ -2183,8 +2792,12 @@ void Application::UpdateBenchmark(
     std::wostringstream report;
 
     report
-        << L"\n========== Baseline Result ==========\n"
-        << L"Resolution: "
+        << L"\n========== Benchmark Result ==========\n"
+        << L"Render mode: "
+        << benchmarkPointRenderModeName
+        << L"\nDetail mode: "
+        << benchmarkDetailModeName
+        << L"\nResolution: "
         << clientWidth_
         << L"x"
         << clientHeight_
@@ -2199,8 +2812,8 @@ void Application::UpdateBenchmark(
             PointMemoryBudgetBytes)
         / (1024.0 * 1024.0)
         << L" MiB"
-        << L"\nDrawn points: "
-        << graphics_.GetPointCount()
+        << L"\nDraw-point budget: "
+        << MaximumDrawnPoints
         << L"\nGPU point memory: "
         << std::fixed
         << std::setprecision(2)
@@ -2208,27 +2821,63 @@ void Application::UpdateBenchmark(
             graphics_.GetPointBufferSizeBytes())
         / (1024.0 * 1024.0)
         << L" MiB"
+        << L"\nCLOD reduction buffers: "
+        << static_cast<double>(
+            graphics_.GetClodReductionBufferSizeBytes())
+        / (1024.0 * 1024.0)
+        << L" MiB"
+        << L"\nCLOD factor: "
+        << graphics_.GetClodFactor()
+        << L"\nMaximum CLOD overflow: "
+        << benchmarkOverflowPointCount_
+        << L"\nAverage drawn points: "
+        << std::setprecision(0)
+        << averageDrawnPoints
+        << L"\nAverage draw ranges: "
+        << averageDrawRanges
+        << std::setprecision(2)
         << L"\nAverage frame: "
         << averageFrameMilliseconds
         << L" ms"
-        << L"\nAverage CPU: "
+        << L"\nMaximum frame: "
+        << maximumFrameMilliseconds
+        << L" ms"
+        << L"\nFrame p95: "
+        << frameP95Milliseconds
+        << L" ms"
+        << L"\nFrame p99: "
+        << frameP99Milliseconds
+        << L" ms"
+        << L"\nAverage CPU render: "
         << averageCpuMilliseconds
         << L" ms"
-        << L"\nAverage GPU: "
+        << L"\nAverage GPU render: "
         << averageGpuMilliseconds
         << L" ms"
         << L"\nAverage FPS: "
         << std::setprecision(1)
         << averageFramesPerSecond
-        << L"\n=====================================\n";
+        << L"\n======================================\n";
 
     OutputDebugStringW(
         report.str().c_str());
 
+    // Append every run so discrete and CLOD measurements can be
+    // captured separately and compared after closing the app.
+    std::wofstream reportFile(
+        std::filesystem::path(
+            L"PointCloudRenderer_Benchmark.txt"),
+        std::ios::app);
+
+    if (reportFile)
+    {
+        reportFile << report.str();
+    }
+
     MessageBoxW(
         window_,
         report.str().c_str(),
-        L"Point Cloud Baseline Result",
+        L"Point Cloud Benchmark Result",
         MB_OK | MB_ICONINFORMATION);
 
     benchmarkPhase_ =
@@ -2242,6 +2891,26 @@ void Application::StartBenchmark()
         return;
     }
 
+    if (requestedPointRenderMode_
+        != activePointRenderMode_)
+    {
+        MessageBoxW(
+            window_,
+            L"The requested renderer is not ready.\n"
+            L"Press C to return to Discrete mode "
+            L"before starting the benchmark.",
+            L"Benchmark Cannot Start",
+            MB_OK | MB_ICONINFORMATION);
+
+        return;
+    }
+
+    benchmarkPointRenderMode_ =
+        activePointRenderMode_;
+
+    benchmarkFullDetailMode_ =
+        fullDetailMode_;
+
     FramePointCloud();
 
     benchmarkPhase_ =
@@ -2253,8 +2922,23 @@ void Application::StartBenchmark()
     benchmarkCpuTimeTotal_ = 0.0;
     benchmarkGpuTimeTotal_ = 0.0;
 
+    benchmarkDrawnPointTotal_ = 0;
+    benchmarkDrawRangeTotal_ = 0;
+    benchmarkOverflowPointCount_ = 0;
+
+    benchmarkFrameTimeSamples_.clear();
+    benchmarkFrameTimeSamples_.reserve(300);
+
+    const wchar_t* benchmarkModeName =
+        benchmarkPointRenderMode_
+        == PointRenderMode::Continuous
+        ? L"CLOD"
+        : L"Discrete";
+
     benchmarkStatusText_ =
-        L"Benchmark: warming up";
+        std::wstring(L"Benchmark: warming up (")
+        + benchmarkModeName
+        + L")";
 }
 
 void Application::RegisterWindowClass()

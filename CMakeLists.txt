@@ -90,12 +90,81 @@ add_custom_command(
     VERBATIM
 )
 
+add_custom_command(
+    OUTPUT
+        "${GENERATED_SHADER_DIRECTORY}/ClodReduceCS.h"
+
+    COMMAND
+        "${DXC_EXECUTABLE}"
+        -T cs_6_0
+        -E CSMain
+        -WX
+        -Fh "${GENERATED_SHADER_DIRECTORY}/ClodReduceCS.h"
+        -Vn g_clodReduceComputeShader
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ClodReduce.hlsl"
+
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ClodReduce.hlsl"
+
+    COMMENT
+        "Compiling CLOD reduction compute shader"
+
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT
+        "${GENERATED_SHADER_DIRECTORY}/ClodDrawVS.h"
+
+    COMMAND
+        "${DXC_EXECUTABLE}"
+        -T vs_6_0
+        -E VSMain
+        -WX
+        -Fh "${GENERATED_SHADER_DIRECTORY}/ClodDrawVS.h"
+        -Vn g_clodDrawVertexShader
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ClodDraw.hlsl"
+
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ClodDraw.hlsl"
+
+    COMMENT
+        "Compiling CLOD splat vertex shader"
+
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT
+        "${GENERATED_SHADER_DIRECTORY}/ClodDrawPS.h"
+
+    COMMAND
+        "${DXC_EXECUTABLE}"
+        -T ps_6_0
+        -E PSMain
+        -WX
+        -Fh "${GENERATED_SHADER_DIRECTORY}/ClodDrawPS.h"
+        -Vn g_clodDrawPixelShader
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ClodDraw.hlsl"
+
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ClodDraw.hlsl"
+
+    COMMENT
+        "Compiling CLOD splat pixel shader"
+
+    VERBATIM
+)
+
 add_custom_target(
     PointCloudShaders
 
     DEPENDS
         "${GENERATED_SHADER_DIRECTORY}/ReferenceVS.h"
         "${GENERATED_SHADER_DIRECTORY}/ReferencePS.h"
+        "${GENERATED_SHADER_DIRECTORY}/ClodReduceCS.h"
+        "${GENERATED_SHADER_DIRECTORY}/ClodDrawVS.h"
+        "${GENERATED_SHADER_DIRECTORY}/ClodDrawPS.h"
 )
 
 add_executable(PointCloudRenderer WIN32
@@ -119,12 +188,16 @@ add_executable(PointCloudRenderer WIN32
     src/Win32Helpers.h
     src/TileLoadWorker.h
     src/TileLoadWorker.cpp
+    src/ClodPoint.h
+    src/ReducedClodPoint.h
 )
 
 target_sources(
     PointCloudRenderer
     PRIVATE
         shaders/Reference.hlsl
+        shaders/ClodReduce.hlsl
+        shaders/ClodDraw.hlsl
 )
 
 add_dependencies(

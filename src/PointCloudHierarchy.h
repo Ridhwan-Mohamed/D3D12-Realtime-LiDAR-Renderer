@@ -1,6 +1,7 @@
 #pragma once
 
 #include "GpuPoint.h"
+#include "ClodPoint.h"
 
 #include <DirectXMath.h>
 
@@ -71,9 +72,33 @@ struct PointCloudHierarchy
 {
     std::vector<PointHierarchyNode> nodes;
 
-    // Representative points from every hierarchy node
-    // packed into one contiguous array.
+    // Existing discrete-LOD representation.
+    //
+    // The first sourcePointCount entries contain every
+    // original point exactly once in leaf order.
+    // Representative samples for internal nodes are
+    // appended after them.
     std::vector<GpuPoint> points;
+
+    // New continuous-LOD representation.
+    //
+    // Every original source point appears exactly once.
+    // Points will be ordered from coarse levels to fine
+    // levels when M11.1B populates this array.
+    std::vector<ClodPoint> clodPoints;
+
+    // One contiguous range for each CLOD level.
+    //
+    // clodLevelRanges[0] describes all level-zero points,
+    // clodLevelRanges[1] describes level one, and so on.
+    std::vector<PointRange> clodLevelRanges;
+
+    // World-space spacing represented by level zero.
+    //
+    // A later level's approximate spacing is:
+    //
+    // clodRootSpacing / 2^level
+    float clodRootSpacing = 0.0f;
 
     PointHierarchyNodeIndex rootIndex =
         InvalidPointHierarchyNode;

@@ -1,48 +1,93 @@
 # D3D12 Real-Time LiDAR Renderer
 
-A from-scratch Direct3D 12 point-cloud renderer for exploring large LAS, LAZ, and COPC datasets in real time. The project focuses on the systems behind a practical renderer: GPU resource ownership, spatial level of detail, tile residency, point budgets, culling, and performance measurement.
+A from-scratch Direct3D 12 point-cloud renderer for exploring large LAS, LAZ, and COPC datasets. It combines asynchronous tile streaming with two runtime-selectable level-of-detail paths: a conventional CPU-selected hierarchy and an experimental GPU-driven continuous LOD implementation.
 
-> Built as a hands-on graphics programming project using C++20, Win32, Direct3D 12, HLSL, CMake, and LASzip.
+The project was built to study practical graphics systems: D3D12 resource ownership, frames in flight, copy and direct queues, GPU synchronization, spatial data structures, out-of-core residency, compute compaction, indirect drawing, and performance measurement.
 
-## Gallery
-
-| Elevation colouring — Hope, British Columbia | Classification colouring — Niagara, Ontario |
-|:---:|:---:|
-| ![Mountainous LiDAR terrain rendered with an elevation gradient](images/Hope_mountain.png) | ![LiDAR scene rendered using source classification colours](images/Niagara_scene.png) |
-
-## What it does
+## Highlights
 
 - Loads one or more `.las`, `.laz`, or `.copc.laz` files through LASzip.
-- Reads point counts, bounds, coordinate systems, classifications, and available attributes.
 - Converts large geospatial coordinates into a stable local, Y-up coordinate system.
-- Decodes tiles and builds their octree-like point hierarchies on a background worker thread.
-- Cooperatively cancels unwanted work during LASzip decoding and hierarchy construction.
-- Uploads point buffers through a dedicated D3D12 copy queue without waiting for the GPU each frame.
-- Selects detail using projected point spacing, view-frustum culling, hysteresis, and a global point budget.
-- Keeps nearby tiles resident under a configurable point-memory budget and a stable tile lifecycle.
-- Safely abandons pending uploads and retires evicted buffers only after their fences complete.
-- Renders classification colours or a terrain-style elevation gradient.
-- Displays live FPS, frame time, CPU/GPU timing, point counts, memory usage, tile residency, draw ranges, and culled nodes in the window title.
-- Includes a repeatable fixed-view benchmark mode.
+- Streams tiles through a bounded asynchronous decode, hierarchy-build, upload, and residency pipeline.
+- Cooperatively cancels obsolete LAS decoding and hierarchy work.
+- Uploads point data through a dedicated D3D12 copy queue.
+- Retires evicted GPU buffers only after their fence completes.
+- Switches between discrete hierarchy LOD and GPU continuous LOD with **C**.
+- Compacts selected CLOD points with a compute shader over multiple frames.
+- Draws the generated point count with `ExecuteIndirect`, without a CPU count readback.
+- Renders variable-size circular point splats with distance-based growth.
+- Supports source classification colours and a terrain-style elevation gradient.
+- Reports frame time, CPU/GPU timing, selected points, tile residency, memory, CLOD progress, and overflow.
+- Includes a fixed-view benchmark that records average, maximum, p95, and p99 frame times.
 
-## Rendering pipeline
+## LOD modes
 
-```mermaid
-flowchart LR
-    A[LAS / LAZ / COPC files] --> B[Read metadata]
-    B --> C[Rank tiles by camera distance]
-    C --> D[Queue wanted tile]
-    D --> E[Worker: decode and build hierarchy]
-    E --> F[Copy queue: upload packed points]
-    F --> G[Promote completed tile to resident]
-    G --> H[Frustum and screen-space LOD selection]
-    H --> I[Draw selected point ranges]
+### Discrete hierarchy LOD
 
-    C -. tile no longer wanted .-> J[Request cooperative cancellation]
-    J -.-> E
+Each loaded tile is organized into an octree-like hierarchy. The CPU traverses that hierarchy using projected point spacing, frustum culling, hysteresis, and a global point budget.
+
+When a node needs more detail, the renderer replaces its representative range with ranges from its children. This is efficient and works well for streamed datasets, but exchanging whole node ranges can produce visible density changes or popping.
+
+### Continuous LOD
+
+The experimental CLOD path is inspired by *Real-Time Continuous Level of Detail Rendering of Point Clouds* by Markus Schütz, Katharina Krösl, and Michael Wimmer.
+
+Every original point is assigned once to an additive hierarchy level and stored in a flat per-tile source buffer:
+
+```text
+position.xyz | packed colour + hierarchy level
 ```
 
-The render thread polls worker results and copy-fence progress without waiting for either stage. CPU preparation and GPU upload are separately bounded so large temporary point arrays cannot accumulate. The current COPC path still reads each file sequentially through LASzip; native COPC hierarchy traversal and HTTP range streaming are future work.
+A compute shader evaluates resident source points individually. It:
+
+1. Projects each point into the reduction view.
+2. Derives the point's represented spacing from its hierarchy level.
+3. Calculates the desired spacing from camera distance and the CLOD factor.
+4. Uses a stable per-point random fraction to soften integer-level boundaries.
+5. Appends useful points into a shared reduced buffer.
+
+The latest complete reduced buffer remains drawable while the next one is assembled over several frames. The GPU-written point count becomes an indirect draw argument, and each surviving point is rendered as a camera-facing circular splat. Newly eligible points grow through a distance-based blend range instead of appearing immediately at full size.
+
+## Pipeline
+
+```mermaid
+flowchart TD
+    A[LAS / LAZ / COPC files] --> B[Metadata and tile priority]
+    B --> C[Background LAS decode]
+    C --> D[Build discrete hierarchy]
+    D --> E[Build flat additive CLOD data]
+    D --> F[Copy queue upload]
+    E --> F
+    F --> G[Resident tile set]
+
+    G --> H[CPU hierarchy traversal]
+    H --> I[Discrete point-range draws]
+
+    G --> J[Multi-frame compute reduction]
+    J --> K[Reduced points + indirect arguments]
+    K --> L[Indirect point-splat draw]
+
+    I <-->|C key| L
+```
+
+The tile streamer decides **which source tiles are resident**. The selected render mode decides **which points from those tiles are drawn**.
+
+## Resource lifetime model
+
+Tiles move through an explicit lifecycle:
+
+```text
+Unloaded -> Queued -> Loading -> ReadyForUpload
+         -> Uploading -> Resident -> Retiring -> Unloaded
+```
+
+- Request generations prevent stale worker results from reviving cancelled tiles.
+- Stop tokens allow long CPU loops to exit cooperatively.
+- Copy fences protect upload resources.
+- Direct-queue retirement fences protect buffers referenced by submitted draws or dispatches.
+- An active CLOD reduction temporarily pins its source tiles.
+- Source-set generations prevent a completed reduction from drawing stale or evicted tiles.
+- Output overflow remains inside the fixed allocation and automatically raises the next CLOD factor.
 
 ## Controls
 
@@ -57,10 +102,12 @@ The render thread polls worker results and copy-fence progress without waiting f
 | `R` | Frame the complete dataset |
 | `1` | Classification colours |
 | `2` | Elevation colours |
-| `L` | Toggle budgeted LOD / full detail |
+| `C` | Switch between Discrete and CLOD rendering |
+| `[` / `]` | Increase / decrease CLOD density |
+| `L` | Toggle budgeted discrete LOD / full detail |
 | `B` | Run the fixed-view benchmark |
 
-Full-detail mode intentionally bypasses the global draw budget. Large datasets can overwhelm an integrated GPU in this mode.
+The benchmark appends its results to `PointCloudRenderer_Benchmark.txt` in the process working directory.
 
 ## Requirements
 
@@ -74,9 +121,7 @@ Full-detail mode intentionally bypasses the global draw budget. Large datasets c
 
 ## Build
 
-The easiest route is to open the repository as a CMake folder in Visual Studio 2022 and build the `PointCloudRenderer` target.
-
-From a **Developer PowerShell for Visual Studio 2022** terminal:
+Open the repository as a CMake folder in Visual Studio 2022 and build the `PointCloudRenderer` target, or use a **Developer PowerShell for Visual Studio 2022** terminal:
 
 ```powershell
 cmake -S . -B out/build/x64-Release -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -90,10 +135,12 @@ For a debug build, replace `x64-Release` and `Release` with `x64-Debug` and `Deb
 Pass one or more point-cloud files as command-line arguments:
 
 ```powershell
-& ".\out\build\x64-Release\PointCloudRenderer.exe" "C:\point-clouds\tile-01.copc.laz" "C:\point-clouds\tile-02.copc.laz"
+& ".\out\build\x64-Release\PointCloudRenderer.exe" `
+    "C:\point-clouds\tile-01.copc.laz" `
+    "C:\point-clouds\tile-02.copc.laz"
 ```
 
-To launch every tile in a folder without PowerShell line-continuation characters:
+To launch every LAZ tile in a folder:
 
 ```powershell
 $tiles = @(
@@ -105,36 +152,47 @@ $tiles = @(
 & ".\out\build\x64-Release\PointCloudRenderer.exe" @tiles
 ```
 
-Point-cloud datasets are intentionally excluded from the repository because they are often hundreds of megabytes or several gigabytes.
+Datasets are excluded from the repository because they are commonly hundreds of megabytes or several gigabytes.
 
-## Current architecture
+## Performance tuning
 
-- **Application:** Win32 lifetime, input, dataset coordination, tile priority, lifecycle transitions, residency, LOD selection, and benchmark state.
-- **Tile load worker:** one bounded C++20 worker thread for decoding and hierarchy preparation, with generation checks and cooperative stop tokens for stale requests.
-- **LAS loader:** metadata inspection, LASzip decoding, coordinate conversion, classification colours, and periodic cancellation checks.
-- **Hierarchy builder:** cancellable spatial subdivision, leaf packing, representative sampling, bounds, and spacing estimates.
-- **D3D12 context:** device and swap chain ownership, frames in flight, a dedicated copy queue, asynchronous point uploads, fence-safe abandonment and retirement, timing queries, and drawing.
-- **HLSL shader:** camera transformation plus classification or elevation colouring.
+The default limits are compile-time constants so experiments remain repeatable:
 
-Tiles move through an explicit lifecycle:
+| Setting | Location | Purpose |
+|---|---|---|
+| `PointMemoryBudgetBytes` | `src/Application.h` | Combined resident discrete and CLOD tile data |
+| `MaximumDrawnPoints` | `src/Application.h` | CLOD output capacity and discrete draw budget |
+| `ClodReductionSourcePointBudgetPerFrame` | `src/D3D12Context.h` | Maximum source points examined by compute each frame |
 
-```text
-Unloaded -> Queued -> Loading -> ReadyForUpload
-         -> Uploading -> Resident -> Retiring -> Unloaded
-```
+The current defaults favor predictable behavior during development. A 6 GB GTX 1660 Super can use larger limits, but the tile budget should leave room for two reduced CLOD buffers, swap-chain and depth resources, the desktop compositor, and other applications. Benchmark Release builds after each increase rather than allocating the full advertised VRAM.
 
-Request generations prevent stale worker results from reviving an unwanted tile. Stop tokens avoid finishing obsolete CPU work, while copy and direct-queue fences keep GPU resources alive until their last command completes.
+## Project structure
+
+- **Application:** Win32 lifetime, input, tile priority, lifecycle transitions, residency, mode switching, and benchmarks.
+- **TileLoadWorker:** bounded C++20 background work, generation checks, and cooperative cancellation.
+- **LasPointCloudLoader:** metadata inspection, LASzip decoding, coordinate conversion, and render attributes.
+- **PointCloudHierarchyBuilder:** spatial subdivision, representative sampling, additive CLOD levels, bounds, and spacing.
+- **D3D12Context:** device and swap chain, frames in flight, queues, uploads, descriptors, compute reduction, indirect drawing, timing, and fence-safe retirement.
+- **ClodReduce.hlsl:** point-wise frustum, spacing, randomization, and compaction logic.
+- **ClodDraw.hlsl:** indirect instanced splats, point growth, colouring, and circular pixel masking.
 
 ## Current limitations
 
-- COPC files are decoded as ordinary LAZ files; the internal COPC hierarchy is not yet used for partial loading.
-- The hierarchy is rebuilt when a tile is loaded instead of being cached on disk.
-- Upload-buffer allocation and the CPU staging copy still begin on the main thread before the copy queue takes over.
-- The streaming pipeline intentionally uses one CPU preparation job and one GPU upload at a time to keep temporary memory predictable.
+- COPC files are currently decoded as ordinary LAZ files; native COPC hierarchy traversal and HTTP range streaming are future work.
+- The hierarchy and flat CLOD representation are rebuilt instead of cached on disk.
+- Each tile retains both its discrete and CLOD representations to support immediate comparison.
+- Multi-frame CLOD results are complete and stable, but swapping camera-dependent point subsets can still show layering during quick movement.
+- The CLOD reduction scans resident source points repeatedly; it is a research implementation rather than a final production policy.
 - The renderer currently targets Windows and Direct3D 12.
 
-The next research milestone explores continuous, budget-aware LOD refinement and compares it with the current discrete hierarchy traversal. Native COPC streaming and hierarchy caching remain longer-term extensions.
+## Roadmap
+
+- Record a repeatable Discrete versus CLOD fly-through and publish benchmark results.
+- Add a scripted camera path for matching captures.
+- Use native COPC hierarchy traversal for regional and remote streaming.
+- Cache preprocessed hierarchy and CLOD data.
+- Explore VR rendering, stereo views, and motion-aware peripheral coverage.
 
 ## Dataset note
 
-The screenshots use Canadian public LiDAR data. Dataset files are not redistributed in this repository.
+The renderer is tested with public LiDAR datasets. Dataset files are not redistributed in this repository.

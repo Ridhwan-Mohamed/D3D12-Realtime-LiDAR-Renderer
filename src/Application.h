@@ -25,6 +25,12 @@ class Application
         Measuring
     };
 
+    enum class PointRenderMode : std::uint8_t
+    {
+        Discrete,
+        Continuous
+    };
+
     void StartBenchmark();
 
     void UpdateBenchmark(
@@ -51,6 +57,16 @@ private:
         Retiring
     };
 
+    enum class ClodLifecycleState : std::uint8_t
+    {
+        NotRequested,
+        ReadyToBuild,
+        Building,
+        ReadyForUpload,
+        Uploading,
+        Resident
+    };
+
     struct TileResidencyState
     {
         std::size_t metadataIndex = 0;
@@ -75,6 +91,11 @@ private:
         std::uint64_t requestGeneration = 0;
 
         std::stop_source loadStopSource;
+
+        // CLOD preparation proceeds independently after the
+        // discrete tile has begun uploading.
+        ClodLifecycleState clodLifecycleState =
+            ClodLifecycleState::NotRequested;
 
         [[nodiscard]]
         bool IsResident() const noexcept
@@ -189,11 +210,24 @@ private:
 
     bool benchmarkKeyWasDown_ = false;
 
+    PointRenderMode benchmarkPointRenderMode_ =
+        PointRenderMode::Discrete;
+
     std::uint32_t benchmarkFrameCount_ = 0;
 
     double benchmarkFrameTimeTotal_ = 0.0;
     double benchmarkCpuTimeTotal_ = 0.0;
     double benchmarkGpuTimeTotal_ = 0.0;
+
+    std::vector<double>
+        benchmarkFrameTimeSamples_;
+
+    std::uint64_t benchmarkDrawnPointTotal_ = 0;
+    std::uint64_t benchmarkDrawRangeTotal_ = 0;
+
+    std::uint32_t benchmarkOverflowPointCount_ = 0;
+
+    bool benchmarkFullDetailMode_ = false;
 
     std::wstring benchmarkStatusText_;
 
@@ -206,6 +240,13 @@ private:
     void UpdateTileResidency(float deltaSeconds);
     void ProcessTileLoadStartedEvents();
     void ProcessOneCompletedTileLoad();
+    void TryStartClodBuilds();
+    void ProcessCompletedClodBuilds();
+    void TryStartClodUploads();
+    void ProcessCompletedClodUploads();
+    void CancelClodWork(
+        std::size_t stateIndex,
+        TileResidencyState& state);
     void ProcessCompletedPointUploads();
     void CancelUnwantedCpuTileRequests();
     void CancelUnwantedPointUploads();
@@ -222,9 +263,20 @@ private:
     static constexpr std::size_t MaximumConcurrentPointUploads = 1;
     static constexpr float RefinePointSpacingPixels = 2.2f;
     static constexpr float CoarsenPointSpacingPixels = 1.8f;
-    static constexpr std::uint64_t MaximumDrawnPoints = 2'000'000;
+    static constexpr std::uint64_t MaximumDrawnPoints = 3'500'000;
+    PointRenderMode requestedPointRenderMode_ =
+        PointRenderMode::Discrete;
+
+    PointRenderMode activePointRenderMode_ =
+        PointRenderMode::Discrete;
+
+    bool pointRenderModeKeyWasDown_ = false;
+    bool denserClodKeyWasDown_ = false;
+    bool sparserClodKeyWasDown_ = false;
+
     bool fullDetailMode_ = false;
     bool detailModeKeyWasDown_ = false;
+
     std::size_t selectedDrawRangeCount_ = 0;
     std::size_t frustumCulledNodeCount_ = 0;
 

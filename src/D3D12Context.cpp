@@ -12,10 +12,15 @@
 #include <chrono>
 #include <utility>
 #include <algorithm>
+#include <cstddef>
 
 #include "Camera.h"
 #include "ReferenceVS.h"
 #include "ReferencePS.h"
+#include "ClodReduceCS.h"
+#include "ClodDrawVS.h"
+#include "ClodDrawPS.h"
+#include "ReducedClodPoint.h"
 
 namespace
 {
@@ -23,16 +28,84 @@ namespace
     {
         DirectX::XMFLOAT4X4 viewProjection;
 
-        float minimumElevation;
-        float maximumElevation;
+        float minimumElevation = 0.0f;
+        float maximumElevation = 0.0f;
 
-        std::uint32_t pointColorMode;
-        float padding;
+        std::uint32_t pointColorMode = 0;
+
+        // Same density factor used by CLOD reduction.
+        float clodFactor = 1.0f;
+
+        DirectX::XMFLOAT2 viewportSize{};
+
+        float clodPointSizePixels = 1.0f;
+        float clodMinimumPointSizePixels = 1.0f;
+
+        DirectX::XMFLOAT3 cameraPosition{};
+
+        float clodBlendRangeFactor = 0.8f;
+
+        float clodPeripheralDensityFalloff = 0.5f;
+        float clodMinimumPeripheralDensity = 0.3f;
+        DirectX::XMFLOAT2 clodPeripheralPadding{};
     };
 
     static_assert(
-        sizeof(CameraConstants) == 80,
+        sizeof(CameraConstants) == 128,
         "CameraConstants must match the HLSL layout.");
+
+    struct ClodReductionConstants
+    {
+        // Range within the currently bound tile.
+        std::uint32_t sourceFirstPoint = 0;
+        std::uint32_t sourcePointCount = 0;
+
+        std::uint32_t outputCapacity = 0;
+        float rootSpacing = 0.0f;
+
+        float clodFactor = 1.0f;
+        DirectX::XMFLOAT3 cameraPosition{};
+
+        float frustumExpansion = 2.0f;
+        float peripheralDensityFalloff = 0.5f;
+        float minimumPeripheralDensity = 0.3f;
+        float padding = 0.0f;
+
+        DirectX::XMFLOAT4X4 viewProjection{};
+    };
+
+    static_assert(
+        sizeof(ClodReductionConstants) == 112,
+        "ClodReductionConstants must match the HLSL layout.");
+
+    static_assert(
+        sizeof(ClodReductionConstants)
+        / sizeof(std::uint32_t)
+        == 28,
+        "CLOD root-signature constant count changed.");
+
+    struct ClodReductionControl
+    {
+        D3D12_DRAW_ARGUMENTS drawArguments{
+            6, // Six vertices form one quad.
+            0, // Compute increments one instance per accepted point.
+            0, // StartVertexLocation
+            0  // StartInstanceLocation
+        };
+
+        std::uint32_t overflowPointCount = 0;
+    };
+
+    static_assert(
+        offsetof(
+            ClodReductionControl,
+            drawArguments)
+        == 0);
+
+    static_assert(
+        sizeof(ClodReductionControl)
+        == sizeof(D3D12_DRAW_ARGUMENTS)
+        + sizeof(std::uint32_t));
 
     constexpr std::uint64_t
         ConstantBufferAlignment = 256;
@@ -51,7 +124,8 @@ using Microsoft::WRL::ComPtr;
 void D3D12Context::Initialize(
     HWND window,
     std::uint32_t width,
-    std::uint32_t height)
+    std::uint32_t height,
+    std::uint32_t clodOutputCapacity)
 {
     EnableDebugLayer();
     CreateFactory();
@@ -65,6 +139,8 @@ void D3D12Context::Initialize(
     CreateDepthResources(width, height);
     UpdateViewportAndScissor(width, height);
     CreateGraphicsPipeline();
+    CreateClodReductionPipeline();
+    CreateClodReductionResources(clodOutputCapacity);
     CreateCommandObjects();
     CreateGpuTimingResources();
     CreateFence();
@@ -598,6 +674,723 @@ void D3D12Context::CreateGraphicsPipeline()
 
     pipelineState_->SetName(
         L"Reference Geometry Pipeline");
+
+    constexpr D3D12_INPUT_ELEMENT_DESC
+        clodInputElements[]{
+        {
+            "CORNER",
+            0,
+            DXGI_FORMAT_R32G32_FLOAT,
+            0,
+            0,
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            0
+        },
+        {
+            "POSITION",
+            0,
+            DXGI_FORMAT_R32G32B32_FLOAT,
+            1,
+            0,
+            D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+            1
+        },
+        {
+            "COLOR",
+            0,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            1,
+            12,
+            D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+            1
+        },
+        {
+            "POINT_SPACING",
+            0,
+            DXGI_FORMAT_R32_FLOAT,
+            1,
+            16,
+            D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+            1
+        }
+    };
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC
+        clodPipelineDescription =
+        pipelineDescription;
+
+    clodPipelineDescription.VS = {
+        g_clodDrawVertexShader,
+        sizeof(g_clodDrawVertexShader)
+    };
+
+    clodPipelineDescription.PS = {
+        g_clodDrawPixelShader,
+        sizeof(g_clodDrawPixelShader)
+    };
+
+    clodPipelineDescription.InputLayout = {
+        clodInputElements,
+        static_cast<UINT>(
+            std::size(clodInputElements))
+    };
+
+    clodPipelineDescription.PrimitiveTopologyType =
+        D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+
+    ThrowIfFailed(
+        device_->CreateGraphicsPipelineState(
+            &clodPipelineDescription,
+            IID_PPV_ARGS(
+                &clodDrawPipelineState_)),
+        "Create CLOD splat graphics pipeline");
+
+    clodDrawPipelineState_->SetName(
+        L"CLOD Splat Graphics Pipeline");
+
+    constexpr std::array<
+        DirectX::XMFLOAT2,
+        6>
+        quadCorners{
+            DirectX::XMFLOAT2{ -0.5f, -0.5f },
+            DirectX::XMFLOAT2{ -0.5f,  0.5f },
+            DirectX::XMFLOAT2{  0.5f,  0.5f },
+
+            DirectX::XMFLOAT2{ -0.5f, -0.5f },
+            DirectX::XMFLOAT2{  0.5f,  0.5f },
+            DirectX::XMFLOAT2{  0.5f, -0.5f }
+    };
+
+    constexpr std::uint64_t quadBufferSize =
+        sizeof(quadCorners);
+
+    clodQuadVertexBuffer_ =
+        CreateBuffer(
+            quadBufferSize,
+            D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_RESOURCE_STATE_GENERIC_READ);
+
+    clodQuadVertexBuffer_->SetName(
+        L"CLOD Shared Quad Vertex Buffer");
+
+    void* mappedQuadData = nullptr;
+
+    D3D12_RANGE noCpuReads{
+        0,
+        0
+    };
+
+    ThrowIfFailed(
+        clodQuadVertexBuffer_->Map(
+            0,
+            &noCpuReads,
+            &mappedQuadData),
+        "Map CLOD quad vertex buffer");
+
+    std::memcpy(
+        mappedQuadData,
+        quadCorners.data(),
+        sizeof(quadCorners));
+
+    D3D12_RANGE writtenQuadRange{
+        0,
+        sizeof(quadCorners)
+    };
+
+    clodQuadVertexBuffer_->Unmap(
+        0,
+        &writtenQuadRange);
+
+    clodQuadVertexBufferView_.BufferLocation =
+        clodQuadVertexBuffer_->
+        GetGPUVirtualAddress();
+
+    clodQuadVertexBufferView_.SizeInBytes =
+        static_cast<UINT>(
+            sizeof(quadCorners));
+
+    clodQuadVertexBufferView_.StrideInBytes =
+        sizeof(DirectX::XMFLOAT2);
+}
+
+void D3D12Context::
+CreateClodReductionPipeline()
+{
+    // Root parameter 0:
+    //
+    // One SRV descriptor at t0 for the current
+    // resident tile's CLOD source buffer.
+    D3D12_DESCRIPTOR_RANGE sourceRange{};
+
+    sourceRange.RangeType =
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+
+    sourceRange.NumDescriptors = 1;
+    sourceRange.BaseShaderRegister = 0;
+    sourceRange.RegisterSpace = 0;
+
+    sourceRange.OffsetInDescriptorsFromTableStart =
+        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    // Root parameter 1:
+    //
+    // Two contiguous UAV descriptors:
+    //
+    // u0 = reduced point output
+    // u1 = accepted/overflow counters
+    D3D12_DESCRIPTOR_RANGE outputRanges{};
+
+    outputRanges.RangeType =
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+
+    outputRanges.NumDescriptors = 2;
+    outputRanges.BaseShaderRegister = 0;
+    outputRanges.RegisterSpace = 0;
+
+    outputRanges.OffsetInDescriptorsFromTableStart =
+        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    std::array<D3D12_ROOT_PARAMETER, 3>
+        rootParameters{};
+
+    rootParameters[0].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+
+    rootParameters[0].
+        DescriptorTable.NumDescriptorRanges = 1;
+
+    rootParameters[0].
+        DescriptorTable.pDescriptorRanges =
+        &sourceRange;
+
+    rootParameters[0].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_ALL;
+
+    rootParameters[1].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+
+    rootParameters[1].
+        DescriptorTable.NumDescriptorRanges = 1;
+
+    rootParameters[1].
+        DescriptorTable.pDescriptorRanges =
+        &outputRanges;
+
+    rootParameters[1].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_ALL;
+
+    // Root parameter 2:
+    //
+    // Four uint values mapped directly onto b0.
+    //
+    // This avoids allocating a constant-buffer resource
+    // for a tiny per-dispatch structure.
+    rootParameters[2].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+
+    rootParameters[2].
+        Constants.ShaderRegister = 0;
+
+    rootParameters[2].
+        Constants.RegisterSpace = 0;
+
+    rootParameters[2].
+        Constants.Num32BitValues =
+        sizeof(ClodReductionConstants)
+        / sizeof(std::uint32_t);
+
+    rootParameters[2].ShaderVisibility =
+        D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC
+        rootDescription{};
+
+    rootDescription.NumParameters =
+        static_cast<UINT>(
+            rootParameters.size());
+
+    rootDescription.pParameters =
+        rootParameters.data();
+
+    rootDescription.NumStaticSamplers = 0;
+    rootDescription.pStaticSamplers = nullptr;
+
+    rootDescription.Flags =
+        D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    Microsoft::WRL::ComPtr<ID3DBlob>
+        serializedRootSignature;
+
+    Microsoft::WRL::ComPtr<ID3DBlob>
+        rootSignatureErrors;
+
+    const HRESULT serializationResult =
+        D3D12SerializeRootSignature(
+            &rootDescription,
+            D3D_ROOT_SIGNATURE_VERSION_1,
+            &serializedRootSignature,
+            &rootSignatureErrors);
+
+    if (rootSignatureErrors)
+    {
+        const char* errorText =
+            static_cast<const char*>(
+                rootSignatureErrors->
+                GetBufferPointer());
+
+        OutputDebugStringA(errorText);
+    }
+
+    ThrowIfFailed(
+        serializationResult,
+        "Serialize CLOD reduction root signature");
+
+    ThrowIfFailed(
+        device_->CreateRootSignature(
+            0,
+            serializedRootSignature->
+            GetBufferPointer(),
+            serializedRootSignature->
+            GetBufferSize(),
+            IID_PPV_ARGS(
+                &clodReductionRootSignature_)),
+        "Create CLOD reduction root signature");
+
+    clodReductionRootSignature_->SetName(
+        L"CLOD Reduction Root Signature");
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC
+        pipelineDescription{};
+
+    pipelineDescription.pRootSignature =
+        clodReductionRootSignature_.Get();
+
+    pipelineDescription.CS = {
+        g_clodReduceComputeShader,
+        sizeof(g_clodReduceComputeShader)
+    };
+
+    pipelineDescription.NodeMask = 0;
+    pipelineDescription.Flags =
+        D3D12_PIPELINE_STATE_FLAG_NONE;
+
+    ThrowIfFailed(
+        device_->CreateComputePipelineState(
+            &pipelineDescription,
+            IID_PPV_ARGS(
+                &clodReductionPipelineState_)),
+        "Create CLOD reduction pipeline state");
+
+    clodReductionPipelineState_->SetName(
+        L"CLOD Reduction Pipeline State");
+
+    D3D12_INDIRECT_ARGUMENT_DESC
+        indirectArgument{};
+
+    indirectArgument.Type =
+        D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+
+    D3D12_COMMAND_SIGNATURE_DESC
+        commandSignatureDescription{};
+
+    commandSignatureDescription.ByteStride =
+        sizeof(D3D12_DRAW_ARGUMENTS);
+
+    commandSignatureDescription.NumArgumentDescs = 1;
+
+    commandSignatureDescription.pArgumentDescs =
+        &indirectArgument;
+
+    commandSignatureDescription.NodeMask = 0;
+
+    ThrowIfFailed(
+        device_->CreateCommandSignature(
+            &commandSignatureDescription,
+            nullptr,
+            IID_PPV_ARGS(
+                &clodDrawCommandSignature_)),
+        "Create CLOD draw command signature");
+
+    clodDrawCommandSignature_->SetName(
+        L"CLOD Draw Command Signature");
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE
+D3D12Context::GetClodCpuDescriptorHandle(
+    std::uint32_t descriptorIndex) const noexcept
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle =
+        clodDescriptorHeap_->
+        GetCPUDescriptorHandleForHeapStart();
+
+    handle.ptr +=
+        static_cast<SIZE_T>(
+            descriptorIndex)
+        * clodDescriptorSize_;
+
+    return handle;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE
+D3D12Context::GetClodGpuDescriptorHandle(
+    std::uint32_t descriptorIndex) const noexcept
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE handle =
+        clodDescriptorHeap_->
+        GetGPUDescriptorHandleForHeapStart();
+
+    handle.ptr +=
+        static_cast<UINT64>(
+            descriptorIndex)
+        * clodDescriptorSize_;
+
+    return handle;
+}
+
+void D3D12Context::
+ResetClodTileDescriptorAllocator()
+{
+    freeClodTileDescriptorIndices_.clear();
+
+    freeClodTileDescriptorIndices_.reserve(
+        MaximumClodTileDescriptors);
+
+    // Push in reverse so pop_back() returns the lowest
+    // available descriptor first.
+    for (std::uint32_t descriptorIndex =
+        ClodDescriptorCount;
+        descriptorIndex
+            > ClodTileDescriptorStart;
+        --descriptorIndex)
+    {
+        freeClodTileDescriptorIndices_.push_back(
+            descriptorIndex - 1);
+    }
+}
+
+std::uint32_t
+D3D12Context::AllocateClodTileDescriptor()
+{
+    if (freeClodTileDescriptorIndices_.empty())
+    {
+        throw std::runtime_error(
+            "CLOD tile descriptor heap exhausted.");
+    }
+
+    const std::uint32_t descriptorIndex =
+        freeClodTileDescriptorIndices_.back();
+
+    freeClodTileDescriptorIndices_.pop_back();
+
+    return descriptorIndex;
+}
+
+void D3D12Context::ReleaseClodTileDescriptor(
+    std::uint32_t descriptorIndex)
+{
+    if (descriptorIndex
+        < ClodTileDescriptorStart
+        || descriptorIndex
+        >= ClodDescriptorCount)
+    {
+        throw std::logic_error(
+            "Invalid CLOD tile descriptor index.");
+    }
+
+    const auto existing =
+        std::find(
+            freeClodTileDescriptorIndices_.begin(),
+            freeClodTileDescriptorIndices_.end(),
+            descriptorIndex);
+
+    if (existing
+        != freeClodTileDescriptorIndices_.end())
+    {
+        throw std::logic_error(
+            "CLOD tile descriptor was released twice.");
+    }
+
+    freeClodTileDescriptorIndices_.push_back(
+        descriptorIndex);
+}
+
+void D3D12Context::CreateClodTileSourceView(
+    GpuPointTile& tile)
+{
+    if (!tile.clodSourceBuffer)
+    {
+        throw std::logic_error(
+            "Cannot create a CLOD SRV without "
+            "a source buffer.");
+    }
+
+    if (tile.uploadedClodPointCount == 0)
+    {
+        throw std::logic_error(
+            "Cannot create a CLOD SRV for an "
+            "empty source buffer.");
+    }
+
+    if (tile.clodSrvDescriptorIndex
+        == InvalidClodDescriptorIndex)
+    {
+        throw std::logic_error(
+            "CLOD tile has no allocated "
+            "descriptor index.");
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC
+        sourceViewDescription{};
+
+    // DXGI_FORMAT_UNKNOWN plus a nonzero structure
+    // stride creates a structured-buffer SRV.
+    sourceViewDescription.Format =
+        DXGI_FORMAT_UNKNOWN;
+
+    sourceViewDescription.ViewDimension =
+        D3D12_SRV_DIMENSION_BUFFER;
+
+    sourceViewDescription.Shader4ComponentMapping =
+        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+
+    sourceViewDescription.Buffer.FirstElement = 0;
+
+    sourceViewDescription.Buffer.NumElements =
+        tile.uploadedClodPointCount;
+
+    sourceViewDescription.Buffer.StructureByteStride =
+        sizeof(ClodPoint);
+
+    sourceViewDescription.Buffer.Flags =
+        D3D12_BUFFER_SRV_FLAG_NONE;
+
+    device_->CreateShaderResourceView(
+        tile.clodSourceBuffer.Get(),
+        &sourceViewDescription,
+        GetClodCpuDescriptorHandle(
+            tile.clodSrvDescriptorIndex));
+}
+
+void D3D12Context::
+CreateClodReductionResources(
+    std::uint32_t outputCapacity)
+{
+    if (outputCapacity == 0)
+    {
+        throw std::invalid_argument(
+            "CLOD output capacity must be positive.");
+    }
+
+    if (outputCapacity
+        > std::numeric_limits<std::uint64_t>::max()
+        / sizeof(ReducedClodPoint))
+    {
+        throw std::overflow_error(
+            "CLOD output-buffer size overflow.");
+    }
+
+    const std::uint64_t outputBufferSize =
+        static_cast<std::uint64_t>(
+            outputCapacity)
+        * sizeof(ReducedClodPoint);
+
+    constexpr std::uint64_t counterBufferSize =
+        sizeof(ClodReductionControl);
+
+    D3D12_DESCRIPTOR_HEAP_DESC
+        heapDescription{};
+
+    heapDescription.Type =
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+
+    heapDescription.NumDescriptors =
+        ClodDescriptorCount;
+
+    heapDescription.Flags =
+        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+    heapDescription.NodeMask = 0;
+
+    ThrowIfFailed(
+        device_->CreateDescriptorHeap(
+            &heapDescription,
+            IID_PPV_ARGS(
+                &clodDescriptorHeap_)),
+        "Create CLOD descriptor heap");
+
+    clodDescriptorHeap_->SetName(
+        L"CLOD Descriptor Heap");
+
+    clodDescriptorSize_ =
+        device_->
+        GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    // Persistent zero-filled source used to reset either
+    // slot's counter buffer through CopyBufferRegion.
+    clodCounterResetUpload_ =
+        CreateBuffer(
+            counterBufferSize,
+            D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_RESOURCE_STATE_GENERIC_READ);
+
+    clodCounterResetUpload_->SetName(
+        L"CLOD Counter Reset Upload");
+
+    void* mappedResetData = nullptr;
+
+    D3D12_RANGE noCpuReads{
+        0,
+        0
+    };
+
+    ThrowIfFailed(
+        clodCounterResetUpload_->Map(
+            0,
+            &noCpuReads,
+            &mappedResetData),
+        "Map CLOD counter reset upload");
+
+    const ClodReductionControl
+        resetControl{};
+
+    std::memcpy(
+        mappedResetData,
+        &resetControl,
+        sizeof(resetControl));
+
+    D3D12_RANGE writtenRange{
+        0,
+        sizeof(resetControl)
+    };
+
+    clodCounterResetUpload_->Unmap(
+        0,
+        &writtenRange);
+
+    for (std::uint32_t slotIndex = 0;
+        slotIndex < ClodReductionSlotCount;
+        ++slotIndex)
+    {
+        ClodReductionSlot& slot =
+            clodReductionSlots_[slotIndex];
+
+        slot.capacity =
+            outputCapacity;
+
+        slot.outputUavDescriptorIndex =
+            slotIndex
+            * ClodDescriptorsPerReductionSlot;
+
+        slot.counterUavDescriptorIndex =
+            slot.outputUavDescriptorIndex + 1;
+
+        slot.pointBuffer =
+            CreateBuffer(
+                outputBufferSize,
+                D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+        slot.counterBuffer =
+            CreateBuffer(
+                counterBufferSize,
+                D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+        slot.counterReadback =
+            CreateBuffer(
+                counterBufferSize,
+                D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+
+        const std::wstring pointBufferName =
+            L"CLOD Reduced Point Buffer "
+            + std::to_wstring(slotIndex);
+
+        const std::wstring counterBufferName =
+            L"CLOD Reduction Counter Buffer "
+            + std::to_wstring(slotIndex);
+
+        const std::wstring readbackName =
+            L"CLOD Counter Readback "
+            + std::to_wstring(slotIndex);
+
+        slot.pointBuffer->SetName(
+            pointBufferName.c_str());
+
+        slot.counterBuffer->SetName(
+            counterBufferName.c_str());
+
+        slot.counterReadback->SetName(
+            readbackName.c_str());
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC
+            pointUavDescription{};
+
+        pointUavDescription.Format =
+            DXGI_FORMAT_UNKNOWN;
+
+        pointUavDescription.ViewDimension =
+            D3D12_UAV_DIMENSION_BUFFER;
+
+        pointUavDescription.Buffer.FirstElement = 0;
+
+        pointUavDescription.Buffer.NumElements =
+            outputCapacity;
+
+        pointUavDescription.Buffer.StructureByteStride =
+            sizeof(ReducedClodPoint);
+
+        pointUavDescription.Buffer.CounterOffsetInBytes =
+            0;
+
+        pointUavDescription.Buffer.Flags =
+            D3D12_BUFFER_UAV_FLAG_NONE;
+
+        device_->CreateUnorderedAccessView(
+            slot.pointBuffer.Get(),
+            nullptr,
+            &pointUavDescription,
+            GetClodCpuDescriptorHandle(
+                slot.outputUavDescriptorIndex));
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC
+            counterUavDescription{};
+
+        // RWByteAddressBuffer requires a raw UAV.
+        counterUavDescription.Format =
+            DXGI_FORMAT_R32_TYPELESS;
+
+        counterUavDescription.ViewDimension =
+            D3D12_UAV_DIMENSION_BUFFER;
+
+        counterUavDescription.Buffer.FirstElement = 0;
+
+        counterUavDescription.Buffer.NumElements =
+            static_cast<UINT>(
+                counterBufferSize
+                / sizeof(std::uint32_t));
+
+        counterUavDescription.Buffer.StructureByteStride =
+            0;
+
+        counterUavDescription.Buffer.CounterOffsetInBytes =
+            0;
+
+        counterUavDescription.Buffer.Flags =
+            D3D12_BUFFER_UAV_FLAG_RAW;
+
+        device_->CreateUnorderedAccessView(
+            slot.counterBuffer.Get(),
+            nullptr,
+            &counterUavDescription,
+            GetClodCpuDescriptorHandle(
+                slot.counterUavDescriptorIndex));
+    }
+
+    ResetClodTileDescriptorAllocator();
 }
 
 void D3D12Context::CreateBackBufferViews()
@@ -663,7 +1456,8 @@ Microsoft::WRL::ComPtr<ID3D12Resource>
 D3D12Context::CreateBuffer(
     std::uint64_t size,
     D3D12_HEAP_TYPE heapType,
-    D3D12_RESOURCE_STATES initialState)
+    D3D12_RESOURCE_STATES initialState,
+    D3D12_RESOURCE_FLAGS flags)
 {
     D3D12_HEAP_PROPERTIES heapProperties{};
 
@@ -685,6 +1479,9 @@ D3D12Context::CreateBuffer(
 
     description.Layout =
         D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    description.Flags =
+        flags;
 
     Microsoft::WRL::ComPtr<ID3D12Resource>
         resource;
@@ -1161,6 +1958,14 @@ void D3D12Context::WaitForPendingPointUploads()
             upload.copyFenceValue);
     }
 
+    for (const PendingClodTileUpload& upload :
+        pendingClodTileUploads_)
+    {
+        latestFenceValue = std::max(
+            latestFenceValue,
+            upload.copyFenceValue);
+    }
+
     if (latestFenceValue != 0)
     {
         WaitForCopyFenceValue(
@@ -1168,44 +1973,629 @@ void D3D12Context::WaitForPendingPointUploads()
     }
 }
 
-void D3D12Context::RecordPointTileUploadTransitions()
+void D3D12Context::
+RecordPointTileUploadTransitions()
 {
     for (GpuPointTile& tile :
         pointTiles_)
     {
-        if (!tile.needsCopyToVertexTransition
-            || !tile.pointBuffer)
+        std::array<
+            D3D12_RESOURCE_BARRIER,
+            2>
+            barriers{};
+
+        UINT barrierCount = 0;
+
+        if (tile.needsCopyToVertexTransition
+            && tile.pointBuffer)
+        {
+            D3D12_RESOURCE_BARRIER& barrier =
+                barriers[barrierCount++];
+
+            barrier.Type =
+                D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+
+            barrier.Transition.pResource =
+                tile.pointBuffer.Get();
+
+            barrier.Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+            barrier.Transition.StateBefore =
+                D3D12_RESOURCE_STATE_COPY_DEST;
+
+            barrier.Transition.StateAfter =
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+
+            tile.needsCopyToVertexTransition =
+                false;
+        }
+
+        if (tile.needsCopyToClodSourceTransition
+            && tile.clodSourceBuffer)
+        {
+            D3D12_RESOURCE_BARRIER& barrier =
+                barriers[barrierCount++];
+
+            barrier.Type =
+                D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+
+            barrier.Transition.pResource =
+                tile.clodSourceBuffer.Get();
+
+            barrier.Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+            barrier.Transition.StateBefore =
+                D3D12_RESOURCE_STATE_COPY_DEST;
+
+            barrier.Transition.StateAfter =
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+            tile.needsCopyToClodSourceTransition =
+                false;
+        }
+
+        if (barrierCount != 0)
+        {
+            commandList_->ResourceBarrier(
+                barrierCount,
+                barriers.data());
+        }
+    }
+}
+
+std::optional<std::uint32_t>
+D3D12Context::RecordClodReduction(
+    const Camera& camera)
+{
+    constexpr std::uint32_t threadsPerGroup = 256;
+
+    static_assert(
+        ClodReductionSourcePointBudgetPerFrame
+        <= std::numeric_limits<std::uint32_t>::max());
+
+    bool startedCycleThisFrame = false;
+
+    if (!clodReductionCycle_.IsActive())
+    {
+        std::vector<ClodReductionSource> sources;
+        std::uint64_t totalSourcePointCount = 0;
+
+        for (const GpuPointTile& tile : pointTiles_)
+        {
+            if (!tile.clodSourceBuffer
+                || tile.uploadedClodPointCount == 0
+                || tile.clodSrvDescriptorIndex
+                == InvalidClodDescriptorIndex)
+            {
+                continue;
+            }
+
+            sources.push_back({
+                tile.id,
+                tile.uploadedClodPointCount
+                });
+
+            totalSourcePointCount +=
+                tile.uploadedClodPointCount;
+        }
+
+        if (sources.empty())
+        {
+            return std::nullopt;
+        }
+
+        std::optional<std::uint32_t> selectedSlotIndex;
+
+        for (std::uint32_t offset = 0;
+            offset < ClodReductionSlotCount;
+            ++offset)
+        {
+            const std::uint32_t slotIndex =
+                (
+                    nextClodReductionSlotIndex_
+                    + offset
+                    )
+                % ClodReductionSlotCount;
+
+            // Never overwrite the complete reduction currently
+            // being displayed.
+            if (activeClodReductionSlotIndex_
+                && slotIndex
+                == *activeClodReductionSlotIndex_)
+            {
+                continue;
+            }
+
+            const ClodReductionSlot& candidate =
+                clodReductionSlots_[slotIndex];
+
+            // A nonzero fence means the GPU result has not been
+            // collected yet.
+            if (candidate.completionFenceValue == 0)
+            {
+                selectedSlotIndex = slotIndex;
+                break;
+            }
+        }
+
+        // No output slot is currently available. Continue drawing
+        // the previous completed result without blocking the CPU.
+        if (!selectedSlotIndex)
+        {
+            return std::nullopt;
+        }
+
+        clodReductionCycle_.Reset();
+
+        clodReductionCycle_.outputSlotIndex =
+            *selectedSlotIndex;
+
+        clodReductionCycle_.sources =
+            std::move(sources);
+
+        clodReductionCycle_.totalSourcePointCount =
+            totalSourcePointCount;
+
+        clodReductionCycle_.sourceGeneration =
+            clodSourceGeneration_;
+
+        clodReductionCycle_.cameraPosition =
+            camera.GetPosition();
+
+        DirectX::XMStoreFloat4x4(
+            &clodReductionCycle_.viewProjection,
+            DirectX::XMMatrixTranspose(
+                camera.GetViewProjectionMatrix()));
+
+        clodReductionCycle_.clodFactor =
+            clodFactor_;
+
+        clodReductionCycle_.frustumExpansion =
+            2.0f;
+
+        clodReductionCycle_.peripheralDensityFalloff =
+            0.5f;
+
+        clodReductionCycle_.minimumPeripheralDensity =
+            0.3f;
+
+        ClodReductionSlot& newSlot =
+            clodReductionSlots_[*selectedSlotIndex];
+
+        newSlot.expectedCandidateCount =
+            totalSourcePointCount;
+
+        newSlot.hasValidResult = false;
+
+        startedCycleThisFrame = true;
+    }
+
+    const std::uint32_t selectedSlotIndex =
+        *clodReductionCycle_.outputSlotIndex;
+
+    ClodReductionSlot& slot =
+        clodReductionSlots_[selectedSlotIndex];
+
+    auto transitionResource =
+        [this](
+            ID3D12Resource* resource,
+            D3D12_RESOURCE_STATES& currentState,
+            D3D12_RESOURCE_STATES newState)
+        {
+            if (currentState == newState)
+            {
+                return;
+            }
+
+            D3D12_RESOURCE_BARRIER barrier{};
+
+            barrier.Type =
+                D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+
+            barrier.Transition.pResource = resource;
+
+            barrier.Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+            barrier.Transition.StateBefore =
+                currentState;
+
+            barrier.Transition.StateAfter =
+                newState;
+
+            commandList_->ResourceBarrier(
+                1,
+                &barrier);
+
+            currentState = newState;
+        };
+
+    // The output slot remains in UAV state while several frames
+    // append points into it.
+    transitionResource(
+        slot.pointBuffer.Get(),
+        slot.pointBufferState,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    if (startedCycleThisFrame)
+    {
+        // Counters are reset once at the beginning of the entire
+        // multi-frame reduction, not at the beginning of every
+        // frame.
+        transitionResource(
+            slot.counterBuffer.Get(),
+            slot.counterBufferState,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+
+        commandList_->CopyBufferRegion(
+            slot.counterBuffer.Get(),
+            0,
+            clodCounterResetUpload_.Get(),
+            0,
+            sizeof(ClodReductionControl));
+    }
+
+    transitionResource(
+        slot.counterBuffer.Get(),
+        slot.counterBufferState,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    ID3D12DescriptorHeap* descriptorHeaps[]{
+        clodDescriptorHeap_.Get()
+    };
+
+    commandList_->SetDescriptorHeaps(
+        1,
+        descriptorHeaps);
+
+    commandList_->SetComputeRootSignature(
+        clodReductionRootSignature_.Get());
+
+    commandList_->SetPipelineState(
+        clodReductionPipelineState_.Get());
+
+    // Root parameter 1 begins at the slot's u0
+    // descriptor. Its u1 counter descriptor is directly
+    // beside it in the heap.
+    commandList_->SetComputeRootDescriptorTable(
+        1,
+        GetClodGpuDescriptorHandle(
+            slot.outputUavDescriptorIndex));
+
+    std::uint64_t remainingFrameBudget =
+        ClodReductionSourcePointBudgetPerFrame;
+
+    while (remainingFrameBudget > 0
+        && clodReductionCycle_.sourceIndex
+        < clodReductionCycle_.sources.size())
+    {
+        const ClodReductionSource& source =
+            clodReductionCycle_.sources[
+                clodReductionCycle_.sourceIndex];
+
+        const auto tileIterator =
+            std::find_if(
+                pointTiles_.begin(),
+                pointTiles_.end(),
+                [&source](const GpuPointTile& tile)
+                {
+                    return tile.id == source.tileId;
+                });
+
+        // For now, abandon this result if its source set changes.
+        // M11.9 will give in-progress reductions stronger tile
+        // lifetime guarantees.
+        if (tileIterator == pointTiles_.end()
+            || !tileIterator->clodSourceBuffer
+            || tileIterator->clodSrvDescriptorIndex
+            == InvalidClodDescriptorIndex
+            || tileIterator->uploadedClodPointCount
+            != source.pointCount)
+        {
+            slot.hasValidResult = false;
+            clodReductionCycle_.Reset();
+
+            return std::nullopt;
+        }
+
+        const GpuPointTile& tile =
+            *tileIterator;
+
+        if (clodReductionCycle_.sourceFirstPoint
+            >= source.pointCount)
+        {
+            ++clodReductionCycle_.sourceIndex;
+            clodReductionCycle_.sourceFirstPoint = 0;
+
+            continue;
+        }
+
+        const std::uint32_t pointsRemainingInTile =
+            source.pointCount
+            - clodReductionCycle_.sourceFirstPoint;
+
+        const std::uint32_t budgetThisDispatch =
+            static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(
+                    remainingFrameBudget,
+                    std::numeric_limits<
+                    std::uint32_t>::max()));
+
+        const std::uint32_t pointsThisDispatch =
+            std::min(
+                pointsRemainingInTile,
+                budgetThisDispatch);
+
+        commandList_->SetComputeRootDescriptorTable(
+            0,
+            GetClodGpuDescriptorHandle(
+                tile.clodSrvDescriptorIndex));
+
+        ClodReductionConstants reductionConstants{};
+
+        reductionConstants.sourceFirstPoint =
+            clodReductionCycle_.sourceFirstPoint;
+
+        reductionConstants.sourcePointCount =
+            pointsThisDispatch;
+
+        reductionConstants.outputCapacity =
+            slot.capacity;
+
+        reductionConstants.rootSpacing =
+            tile.clodRootSpacing;
+
+        reductionConstants.clodFactor =
+            clodReductionCycle_.clodFactor;
+
+        reductionConstants.cameraPosition =
+            clodReductionCycle_.cameraPosition;
+
+        reductionConstants.frustumExpansion =
+            clodReductionCycle_.frustumExpansion;
+
+        reductionConstants.viewProjection =
+            clodReductionCycle_.viewProjection;
+
+        reductionConstants.peripheralDensityFalloff =
+            clodReductionCycle_.peripheralDensityFalloff;
+
+        reductionConstants.minimumPeripheralDensity =
+            clodReductionCycle_.minimumPeripheralDensity;
+
+        commandList_->SetComputeRoot32BitConstants(
+            2,
+            sizeof(ClodReductionConstants)
+            / sizeof(std::uint32_t),
+            &reductionConstants,
+            0);
+
+        const std::uint32_t groupCount =
+            (
+                pointsThisDispatch
+                + threadsPerGroup
+                - 1
+                )
+            / threadsPerGroup;
+
+        commandList_->Dispatch(
+            groupCount,
+            1,
+            1);
+
+        // Ensure this dispatch's appends are visible before another
+        // chunk begins appending to the same buffers.
+        D3D12_RESOURCE_BARRIER uavBarrier{};
+
+        uavBarrier.Type =
+            D3D12_RESOURCE_BARRIER_TYPE_UAV;
+
+        uavBarrier.UAV.pResource = nullptr;
+
+        commandList_->ResourceBarrier(
+            1,
+            &uavBarrier);
+
+        clodReductionCycle_.sourceFirstPoint +=
+            pointsThisDispatch;
+
+        clodReductionCycle_.processedSourcePointCount +=
+            pointsThisDispatch;
+
+        remainingFrameBudget -=
+            pointsThisDispatch;
+
+        if (clodReductionCycle_.sourceFirstPoint
+            == source.pointCount)
+        {
+            ++clodReductionCycle_.sourceIndex;
+            clodReductionCycle_.sourceFirstPoint = 0;
+        }
+    }
+
+    const bool reductionComplete =
+        clodReductionCycle_.sourceIndex
+        >= clodReductionCycle_.sources.size();
+
+    if (!reductionComplete)
+    {
+        // The slot remains private to the active cycle. Its
+        // incomplete contents must not be drawn or read back.
+        return std::nullopt;
+    }
+
+    // Copy the two final counters into CPU-readable memory.
+    transitionResource(
+        slot.counterBuffer.Get(),
+        slot.counterBufferState,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+    commandList_->CopyBufferRegion(
+        slot.counterReadback.Get(),
+        0,
+        slot.counterBuffer.Get(),
+        0,
+        sizeof(ClodReductionControl));
+
+    // Keep the completed draw arguments ready for
+    // ExecuteIndirect.
+    //
+    // The next reduction that reuses this slot will transition
+    // the buffer from INDIRECT_ARGUMENT back through COPY_DEST
+    // and UNORDERED_ACCESS.
+    transitionResource(
+        slot.counterBuffer.Get(),
+        slot.counterBufferState,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+
+    slot.expectedCandidateCount =
+        clodReductionCycle_.totalSourcePointCount;
+
+    slot.resultClodFactor =
+        clodReductionCycle_.clodFactor;
+
+    slot.sourceGeneration =
+        clodReductionCycle_.sourceGeneration;
+
+    slot.hasValidResult = false;
+
+    const std::uint32_t completedSlotIndex =
+        selectedSlotIndex;
+
+    clodReductionCycle_.Reset();
+
+    nextClodReductionSlotIndex_ =
+        (completedSlotIndex + 1)
+        % ClodReductionSlotCount;
+
+    return completedSlotIndex;
+}
+
+void D3D12Context::CollectCompletedClodReductions()
+{
+    const std::uint64_t completedFenceValue =
+        fence_->GetCompletedValue();
+
+    std::optional<std::uint32_t>
+        newestCompletedSlot;
+
+    std::uint64_t newestCompletedFence = 0;
+
+    for (std::uint32_t slotIndex = 0;
+        slotIndex < ClodReductionSlotCount;
+        ++slotIndex)
+    {
+        ClodReductionSlot& slot =
+            clodReductionSlots_[slotIndex];
+
+        if (slot.completionFenceValue == 0
+            || slot.completionFenceValue
+        > completedFenceValue)
         {
             continue;
         }
 
-        D3D12_RESOURCE_BARRIER barrier{};
+        // Save this before clearing it below. It tells us
+        // which completed result was submitted most recently.
+        const std::uint64_t resultFenceValue =
+            slot.completionFenceValue;
 
-        barrier.Type =
-            D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        void* mappedData = nullptr;
 
-        barrier.Transition.pResource =
-            tile.pointBuffer.Get();
+        const D3D12_RANGE readRange{
+            0,
+            sizeof(ClodReductionControl)
+        };
 
-        barrier.Transition.Subresource =
-            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        ThrowIfFailed(
+            slot.counterReadback->Map(
+                0,
+                &readRange,
+                &mappedData),
+            "Map CLOD reduction counters");
 
-        barrier.Transition.StateBefore =
-            D3D12_RESOURCE_STATE_COPY_DEST;
+        ClodReductionControl control{};
 
-        barrier.Transition.StateAfter =
-            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+        std::memcpy(
+            &control,
+            mappedData,
+            sizeof(control));
 
-        commandList_->ResourceBarrier(
-            1,
-            &barrier);
+        const D3D12_RANGE noCpuWrites{
+            0,
+            0
+        };
 
-        tile.needsCopyToVertexTransition =
-            false;
+        slot.counterReadback->Unmap(
+            0,
+            &noCpuWrites);
+
+        slot.lastAcceptedPointCount =
+            control.drawArguments.
+            InstanceCount;
+
+        slot.lastOverflowPointCount =
+            control.overflowPointCount;
+
+        if (slot.lastOverflowPointCount != 0)
+        {
+            // An overflowing append buffer is spatially biased
+            // toward whichever source points happened to be
+            // processed first. Make the following reduction
+            // coarser until its complete result fits.
+            constexpr float overflowRecoveryStep = 1.25f;
+            constexpr float maximumAutomaticFactor = 16.0f;
+
+            const float recoveryFactor =
+                std::min(
+                    slot.resultClodFactor
+                        * overflowRecoveryStep,
+                    maximumAutomaticFactor);
+
+            clodFactor_ =
+                std::max(
+                    clodFactor_,
+                    recoveryFactor);
+        }
+
+        if (slot.lastAcceptedPointCount
+        > slot.capacity
+            || static_cast<std::uint64_t>(
+                slot.lastAcceptedPointCount)
+            + slot.lastOverflowPointCount
+        > slot.expectedCandidateCount)
+        {
+            throw std::logic_error(
+                "CLOD reduction produced invalid counters.");
+        }
+
+        slot.hasValidResult = true;
+        slot.completionFenceValue = 0;
+
+        if (slot.sourceGeneration
+                == clodSourceGeneration_
+            && (!newestCompletedSlot.has_value()
+            || resultFenceValue
+                > newestCompletedFence))
+        {
+            newestCompletedSlot = slotIndex;
+            newestCompletedFence =
+                resultFenceValue;
+        }
+    }
+
+    if (newestCompletedSlot.has_value())
+    {
+        activeClodReductionSlotIndex_ =
+            newestCompletedSlot;
     }
 }
 
-void D3D12Context::Render(const Camera& camera)
+void D3D12Context::Render(
+    const Camera& camera,
+    bool runClodReduction)
 {
     if (!initialized_
         || width_ == 0
@@ -1223,6 +2613,19 @@ void D3D12Context::Render(const Camera& camera)
     WaitForFrame(currentFrame);
 
     ReadGpuTimingResult(currentFrame);
+
+    CollectCompletedClodReductions();
+
+    clodDrawnLastFrame_ = false;
+
+    if (!runClodReduction)
+    {
+        // Cancel only the unfinished build so its source snapshot
+        // cannot pin tiles while Discrete mode is active. Keep the
+        // most recent complete result for an immediate fixed-view
+        // A/B switch back to CLOD.
+        clodReductionCycle_.Reset();
+    }
 
     const auto cpuRenderStart =
         std::chrono::steady_clock::now();
@@ -1244,7 +2647,48 @@ void D3D12Context::Render(const Camera& camera)
         static_cast<std::uint32_t>(
             pointColorMode_);
 
-    constants.padding = 0.0f;
+    constants.clodFactor =
+        clodFactor_;
+
+    constants.viewportSize = {
+        static_cast<float>(width_),
+        static_cast<float>(height_)
+    };
+
+    constants.clodPeripheralDensityFalloff =
+        0.5f;
+
+    constants.clodMinimumPeripheralDensity =
+        0.3f;
+
+    DirectX::XMFLOAT4X4 projection{};
+
+    DirectX::XMStoreFloat4x4(
+        &projection,
+        camera.GetProjectionMatrix());
+
+    // targetSpacing grows linearly with distance:
+    //
+    //     distance * factor / 1000
+    //
+    // Perspective projection divides by approximately that same
+    // distance. The resulting screen-space diameter is therefore
+    // approximately constant.
+    constants.clodPointSizePixels =
+        static_cast<float>(height_)
+        * 0.5f
+        * projection._22
+        * clodFactor_
+        / 1000.0f;
+
+    constants.clodMinimumPointSizePixels =
+        1.0f;
+
+    constants.cameraPosition =
+        camera.GetPosition();
+
+    constants.clodBlendRangeFactor =
+        0.8f;
 
     std::memcpy(
         currentFrame.mappedCameraData,
@@ -1273,6 +2717,21 @@ void D3D12Context::Render(const Camera& camera)
         timestampStartIndex);
 
     RecordPointTileUploadTransitions();
+
+    std::optional<std::uint32_t>
+        submittedClodReduction;
+
+    if (runClodReduction)
+    {
+        submittedClodReduction =
+            RecordClodReduction(camera);
+    }
+
+    // RecordClodReduction changes the active pipeline state
+    // to the compute PSO. Restore the graphics PSO before
+    // recording point drawing.
+    commandList_->SetPipelineState(
+        pipelineState_.Get());
 
     commandList_->RSSetViewports(
         1,
@@ -1348,11 +2807,126 @@ void D3D12Context::Render(const Camera& camera)
         currentFrame.cameraBuffer->
         GetGPUVirtualAddress());
 
-    if (!pointTiles_.empty())
+    commandList_->IASetPrimitiveTopology(
+        D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+
+    const bool canDrawClod =
+        runClodReduction
+        && activeClodReductionSlotIndex_.has_value()
+        && clodReductionSlots_[
+            *activeClodReductionSlotIndex_].
+        hasValidResult
+        && clodReductionSlots_[
+            *activeClodReductionSlotIndex_].
+        sourceGeneration == clodSourceGeneration_;
+
+    // The CPU knows that a complete reduction exists, but it
+    // does not supply that reduction's point count.
+    //
+    // ExecuteIndirect reads InstanceCount directly from the
+    // control buffer written by the compute shader.
+    if (canDrawClod)
     {
+        commandList_->SetPipelineState(
+            clodDrawPipelineState_.Get());
+
+        commandList_->IASetPrimitiveTopology(
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        ClodReductionSlot& slot =
+            clodReductionSlots_[
+                *activeClodReductionSlotIndex_];
+
+        // Compute left this buffer as a UAV. The input
+        // assembler needs it in vertex-buffer state.
+        if (slot.pointBufferState
+            != D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)
+        {
+            D3D12_RESOURCE_BARRIER barrier{};
+
+            barrier.Type =
+                D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+
+            barrier.Transition.pResource =
+                slot.pointBuffer.Get();
+
+            barrier.Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+            barrier.Transition.StateBefore =
+                slot.pointBufferState;
+
+            barrier.Transition.StateAfter =
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+
+            commandList_->ResourceBarrier(
+                1,
+                &barrier);
+
+            slot.pointBufferState =
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+        }
+
+        D3D12_VERTEX_BUFFER_VIEW
+            reducedPointBufferView{};
+
+        reducedPointBufferView.BufferLocation =
+            slot.pointBuffer->GetGPUVirtualAddress();
+
+        reducedPointBufferView.SizeInBytes =
+            slot.capacity
+            * static_cast<std::uint32_t>(
+                sizeof(ReducedClodPoint));
+
+        reducedPointBufferView.StrideInBytes =
+            sizeof(ReducedClodPoint);
+
+        const std::array<
+            D3D12_VERTEX_BUFFER_VIEW,
+            2>
+            clodVertexBufferViews{
+                clodQuadVertexBufferView_,
+                reducedPointBufferView
+        };
+
+        commandList_->IASetVertexBuffers(
+            0,
+            static_cast<UINT>(
+                clodVertexBufferViews.size()),
+            clodVertexBufferViews.data());
+
+        commandList_->ExecuteIndirect(
+            clodDrawCommandSignature_.Get(),
+
+            // Execute one D3D12_DRAW_ARGUMENTS command.
+            1,
+
+            // GPU buffer containing the arguments.
+            slot.counterBuffer.Get(),
+
+            // drawArguments begins at byte zero inside
+            // ClodReductionControl.
+            offsetof(
+                ClodReductionControl,
+                drawArguments),
+
+            // No count buffer is needed because we always execute
+            // exactly one draw command.
+            nullptr,
+            0);
+
+        clodDrawnLastFrame_ = true;
+    }
+    else if (!pointTiles_.empty())
+    {
+        commandList_->SetPipelineState(
+            pipelineState_.Get());
+
         commandList_->IASetPrimitiveTopology(
             D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
 
+        // No completed CLOD result yet, or Discrete mode
+        // was requested. Draw the existing hierarchy.
         for (const GpuPointTile& tile :
             pointTiles_)
         {
@@ -1439,6 +3013,16 @@ void D3D12Context::Render(const Camera& camera)
         "Present swap-chain buffer");
 
     SignalFrame(currentFrame);
+
+    if (submittedClodReduction.has_value())
+    {
+        ClodReductionSlot& slot =
+            clodReductionSlots_[
+                *submittedClodReduction];
+
+        slot.completionFenceValue =
+            currentFrame.fenceValue;
+    }
 
     frameIndex_ =
         swapChain_->GetCurrentBackBufferIndex();
@@ -1648,40 +3232,73 @@ PointCloudTileId D3D12Context::AddPointCloudTile(
 
 PointCloudTileId
 D3D12Context::BeginPointCloudTileUpload(
-    std::span<const GpuPoint> points,
+    std::span<const GpuPoint> discretePoints,
+    std::span<const ClodPoint> clodPoints,
     std::uint32_t initialDrawPointCount)
 {
     if (!initialized_)
     {
         throw std::logic_error(
-            "D3D12 must be initialized before loading points.");
+            "D3D12 must be initialized before "
+            "loading points.");
     }
 
-    if (points.empty())
+    if (discretePoints.empty())
     {
         throw std::invalid_argument(
-            "Cannot create an empty GPU point tile.");
+            "Cannot upload an empty discrete "
+            "point hierarchy.");
     }
 
     if (initialDrawPointCount == 0
-        || initialDrawPointCount > points.size())
+        || initialDrawPointCount
+            > discretePoints.size())
     {
         throw std::invalid_argument(
             "Initial point draw count is invalid.");
     }
 
-    const std::uint64_t dataSize =
-        points.size_bytes();
+    // CLOD contains every original point exactly once.
+    // The discrete array may be larger because it also
+    // contains representative copies.
+    if (!clodPoints.empty()
+        && clodPoints.size()
+            != initialDrawPointCount)
+    {
+        throw std::invalid_argument(
+            "CLOD point count does not match "
+            "the source point count.");
+    }
 
-    if (dataSize
+    const std::uint64_t discreteDataSize =
+        discretePoints.size_bytes();
+
+    const std::uint64_t clodDataSize =
+        clodPoints.size_bytes();
+
+    // D3D12_VERTEX_BUFFER_VIEW::SizeInBytes is UINT.
+    // This limit applies to the discrete vertex buffer.
+    if (discreteDataSize
         > std::numeric_limits<UINT>::max())
     {
         throw std::runtime_error(
-            "Point buffer exceeds the D3D12 "
-            "vertex-view size limit.");
+            "Discrete point buffer exceeds the "
+            "D3D12 vertex-view size limit.");
     }
 
-    if (dataSize
+    if (clodDataSize
+        > std::numeric_limits<std::uint64_t>::max()
+        - discreteDataSize)
+    {
+        throw std::overflow_error(
+            "Combined point-upload size overflow.");
+    }
+
+    const std::uint64_t totalDataSize =
+        discreteDataSize
+        + clodDataSize;
+
+    if (totalDataSize
         > std::numeric_limits<std::uint64_t>::max()
         - pointBufferSizeBytes_)
     {
@@ -1697,27 +3314,52 @@ D3D12Context::BeginPointCloudTileUpload(
     tile.id =
         nextPointCloudTileId_++;
 
+    // The existing discrete representation remains a
+    // separate default-heap resource because the input
+    // assembler will consume it as a vertex buffer.
     tile.pointBuffer =
         CreateBuffer(
-            dataSize,
+            discreteDataSize,
             D3D12_HEAP_TYPE_DEFAULT,
             D3D12_RESOURCE_STATE_COPY_DEST);
 
-    const std::wstring tileName =
-        L"Point Cloud Tile "
+    const std::wstring discreteName =
+        L"Discrete Point Tile "
         + std::to_wstring(tile.id);
 
     tile.pointBuffer->SetName(
-        tileName.c_str());
+        discreteName.c_str());
 
+    // CLOD source points live in their own default-heap
+    // resource. M11.3 will expose this resource through
+    // a structured-buffer SRV.
+    if (clodDataSize != 0)
+    {
+        tile.clodSourceBuffer =
+            CreateBuffer(
+                clodDataSize,
+                D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+
+        const std::wstring clodName =
+            L"CLOD Source Tile "
+            + std::to_wstring(tile.id);
+
+        tile.clodSourceBuffer->SetName(
+            clodName.c_str());
+    }
+
+    // One temporary upload heap contains both CPU arrays.
+    // The CLOD bytes begin directly after the discrete
+    // bytes.
     upload.uploadBuffer =
         CreateBuffer(
-            dataSize,
+            totalDataSize,
             D3D12_HEAP_TYPE_UPLOAD,
             D3D12_RESOURCE_STATE_GENERIC_READ);
 
     const std::wstring uploadName =
-        L"Point Cloud Upload Buffer "
+        L"Combined Point Upload Buffer "
         + std::to_wstring(tile.id);
 
     upload.uploadBuffer->SetName(
@@ -1735,16 +3377,39 @@ D3D12Context::BeginPointCloudTileUpload(
             0,
             &noCpuReads,
             &mappedData),
-        "Map asynchronous point upload buffer");
+        "Map combined point upload buffer");
 
+    std::uint8_t* uploadBytes =
+        static_cast<std::uint8_t*>(
+            mappedData);
+
+    // First region:
+    //
+    // upload offset 0
+    //     → discrete GpuPoint data
     std::memcpy(
-        mappedData,
-        points.data(),
-        dataSize);
+        uploadBytes,
+        discretePoints.data(),
+        static_cast<std::size_t>(
+            discreteDataSize));
+
+    // Second region:
+    //
+    // upload offset discreteDataSize
+    //     → additive ClodPoint data
+    if (clodDataSize != 0)
+    {
+        std::memcpy(
+            uploadBytes + discreteDataSize,
+            clodPoints.data(),
+            static_cast<std::size_t>(
+                clodDataSize));
+    }
 
     D3D12_RANGE writtenRange{
         0,
-        static_cast<SIZE_T>(dataSize)
+        static_cast<SIZE_T>(
+            totalDataSize)
     };
 
     upload.uploadBuffer->Unmap(
@@ -1768,29 +3433,51 @@ D3D12Context::BeginPointCloudTileUpload(
                 &upload.commandList)),
         "Create point upload command list");
 
+    // Copy the first upload region into the existing
+    // discrete vertex resource.
     upload.commandList->CopyBufferRegion(
         tile.pointBuffer.Get(),
         0,
         upload.uploadBuffer.Get(),
         0,
-        dataSize);
+        discreteDataSize);
+
+    // Copy the second upload region into the new CLOD
+    // compute-source resource.
+    if (clodDataSize != 0)
+    {
+        upload.commandList->CopyBufferRegion(
+            tile.clodSourceBuffer.Get(),
+            0,
+            upload.uploadBuffer.Get(),
+            discreteDataSize,
+            clodDataSize);
+    }
 
     ThrowIfFailed(
         upload.commandList->Close(),
         "Close point upload command list");
 
+    // Only the discrete buffer needs a vertex-buffer view.
+    // The CLOD buffer will receive an SRV in M11.3.
     tile.pointBufferView.BufferLocation =
-        tile.pointBuffer->GetGPUVirtualAddress();
+        tile.pointBuffer->
+        GetGPUVirtualAddress();
 
     tile.pointBufferView.SizeInBytes =
-        static_cast<UINT>(dataSize);
+        static_cast<UINT>(
+            discreteDataSize);
 
     tile.pointBufferView.StrideInBytes =
         sizeof(GpuPoint);
 
     tile.uploadedPointCount =
         static_cast<std::uint32_t>(
-            points.size());
+            discretePoints.size());
+
+    tile.uploadedClodPointCount =
+        static_cast<std::uint32_t>(
+            clodPoints.size());
 
     tile.drawRanges.push_back({
         0,
@@ -1800,17 +3487,35 @@ D3D12Context::BeginPointCloudTileUpload(
     tile.selectedPointCount =
         initialDrawPointCount;
 
-    tile.sizeBytes =
-        dataSize;
+    tile.discreteSizeBytes =
+        discreteDataSize;
 
+    tile.clodSizeBytes =
+        clodDataSize;
+
+    tile.sizeBytes =
+        totalDataSize;
+
+    // Both resources are currently COPY_DEST.
+    // The direct queue will perform their final
+    // transitions after this upload is finalized.
     tile.needsCopyToVertexTransition =
         true;
+
+    tile.needsCopyToClodSourceTransition =
+        clodDataSize != 0;
 
     const PointCloudTileId tileId =
         tile.id;
 
-    // Store the resources before submitting the work.
-    // They must remain alive until the copy finishes.
+    // This object now owns:
+    //
+    // - both default-heap destination resources
+    // - the shared upload resource
+    // - the copy allocator
+    // - the copy command list
+    //
+    // All of them remain alive until the fence finishes.
     pendingPointTileUploads_.push_back(
         std::move(upload));
 
@@ -1837,10 +3542,12 @@ D3D12Context::BeginPointCloudTileUpload(
     submittedUpload.copyFenceValue =
         fenceValue;
 
-    // Count the default GPU buffer immediately because
-    // the allocation already exists while copying.
+    // Count default-heap memory immediately.
+    //
+    // The resources already occupy GPU memory even
+    // though the copy is still running.
     pointBufferSizeBytes_ +=
-        dataSize;
+        totalDataSize;
 
     return tileId;
 }
@@ -1914,6 +3621,53 @@ bool D3D12Context::FinalizePointCloudTileUpload(
         return false;
     }
 
+    const GpuPointTile& completedTile =
+        uploadIterator->tile;
+
+    if (!completedTile.pointBuffer)
+    {
+        throw std::logic_error(
+            "Completed tile upload is missing a "
+            "GPU point resource.");
+    }
+
+    if (completedTile.uploadedPointCount == 0)
+    {
+        throw std::logic_error(
+            "Completed tile upload has an empty "
+            "point representation.");
+    }
+
+    // At upload time, selectedPointCount is initialized
+    // to the original source count.
+    if (completedTile.uploadedClodPointCount != 0
+        && completedTile.uploadedClodPointCount
+            != completedTile.selectedPointCount)
+    {
+        throw std::logic_error(
+            "Uploaded CLOD count does not match "
+            "the source-point count.");
+    }
+
+    if (completedTile.clodSizeBytes
+        > std::numeric_limits<std::uint64_t>::max()
+        - completedTile.discreteSizeBytes)
+    {
+        throw std::logic_error(
+            "Completed tile byte count overflow.");
+    }
+
+    const std::uint64_t expectedTileBytes =
+        completedTile.discreteSizeBytes
+        + completedTile.clodSizeBytes;
+
+    if (completedTile.sizeBytes
+        != expectedTileBytes)
+    {
+        throw std::logic_error(
+            "Completed tile GPU byte count is invalid.");
+    }
+
     const std::uint64_t selectedPointCount =
         uploadIterator->tile.selectedPointCount;
 
@@ -1929,6 +3683,30 @@ bool D3D12Context::FinalizePointCloudTileUpload(
     // the pending upload remains intact.
     pointTiles_.reserve(
         pointTiles_.size() + 1);
+
+    GpuPointTile& completedGpuTile =
+        uploadIterator->tile;
+
+    if (completedGpuTile.clodSourceBuffer)
+    {
+        const std::uint32_t clodDescriptorIndex =
+            AllocateClodTileDescriptor();
+
+        completedGpuTile.clodSrvDescriptorIndex =
+            clodDescriptorIndex;
+
+        CreateClodTileSourceView(
+            completedGpuTile);
+
+        if (clodSourceGeneration_
+            == std::numeric_limits<std::uint64_t>::max())
+        {
+            throw std::overflow_error(
+                "CLOD source generation overflow.");
+        }
+
+        ++clodSourceGeneration_;
+    }
 
     pointTiles_.push_back(
         std::move(uploadIterator->tile));
@@ -1970,6 +3748,295 @@ bool D3D12Context::AbandonPointCloudTileUpload(
 
     uploadIterator->abandoned = true;
 
+    return true;
+}
+
+bool D3D12Context::BeginPointCloudTileClodUpload(
+    PointCloudTileId tileId,
+    std::span<const ClodPoint> clodPoints,
+    float clodRootSpacing)
+{
+    if (!initialized_)
+    {
+        throw std::logic_error(
+            "D3D12 must be initialized before "
+            "uploading CLOD points.");
+    }
+
+    if (clodPoints.empty())
+    {
+        throw std::invalid_argument(
+            "Cannot attach an empty CLOD hierarchy.");
+    }
+    if (!std::isfinite(clodRootSpacing)
+        || clodRootSpacing <= 0.0f)
+    {
+        throw std::invalid_argument(
+            "CLOD root spacing must be finite "
+            "and greater than zero.");
+    }
+
+    const auto tileIterator =
+        std::find_if(
+            pointTiles_.begin(),
+            pointTiles_.end(),
+            [tileId](const GpuPointTile& tile)
+            {
+                return tile.id == tileId;
+            });
+
+    if (tileIterator == pointTiles_.end()
+        || tileIterator->clodSourceBuffer)
+    {
+        return false;
+    }
+
+    const bool alreadyPending =
+        std::any_of(
+            pendingClodTileUploads_.begin(),
+            pendingClodTileUploads_.end(),
+            [tileId](const PendingClodTileUpload& upload)
+            {
+                return upload.tileId == tileId;
+            });
+
+    if (alreadyPending)
+    {
+        return false;
+    }
+
+    if (clodPoints.size()
+        > std::numeric_limits<std::uint32_t>::max())
+    {
+        throw std::runtime_error(
+            "CLOD point count exceeds the supported limit.");
+    }
+
+    PendingClodTileUpload upload{};
+
+    upload.tileId = tileId;
+    upload.pointCount =
+        static_cast<std::uint32_t>(clodPoints.size());
+    upload.sizeBytes = clodPoints.size_bytes();
+
+    if (upload.sizeBytes
+        > std::numeric_limits<std::uint64_t>::max()
+            - pointBufferSizeBytes_)
+    {
+        throw std::overflow_error(
+            "CLOD upload memory counter overflow.");
+    }
+
+    upload.clodSourceBuffer =
+        CreateBuffer(
+            upload.sizeBytes,
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+
+    upload.rootSpacing =
+        clodRootSpacing;
+
+    const std::wstring sourceName =
+        L"CLOD Source Tile "
+        + std::to_wstring(tileId);
+
+    upload.clodSourceBuffer->SetName(
+        sourceName.c_str());
+
+    upload.uploadBuffer =
+        CreateBuffer(
+            upload.sizeBytes,
+            D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_RESOURCE_STATE_GENERIC_READ);
+
+    void* mappedData = nullptr;
+    D3D12_RANGE noCpuReads{ 0, 0 };
+
+    ThrowIfFailed(
+        upload.uploadBuffer->Map(
+            0,
+            &noCpuReads,
+            &mappedData),
+        "Map CLOD attachment upload buffer");
+
+    std::memcpy(
+        mappedData,
+        clodPoints.data(),
+        static_cast<std::size_t>(upload.sizeBytes));
+
+    D3D12_RANGE writtenRange{
+        0,
+        static_cast<SIZE_T>(upload.sizeBytes)
+    };
+
+    upload.uploadBuffer->Unmap(
+        0,
+        &writtenRange);
+
+    ThrowIfFailed(
+        device_->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_COPY,
+            IID_PPV_ARGS(&upload.commandAllocator)),
+        "Create CLOD attachment allocator");
+
+    ThrowIfFailed(
+        device_->CreateCommandList(
+            0,
+            D3D12_COMMAND_LIST_TYPE_COPY,
+            upload.commandAllocator.Get(),
+            nullptr,
+            IID_PPV_ARGS(&upload.commandList)),
+        "Create CLOD attachment command list");
+
+    upload.commandList->CopyBufferRegion(
+        upload.clodSourceBuffer.Get(),
+        0,
+        upload.uploadBuffer.Get(),
+        0,
+        upload.sizeBytes);
+
+    ThrowIfFailed(
+        upload.commandList->Close(),
+        "Close CLOD attachment command list");
+
+    pendingClodTileUploads_.push_back(
+        std::move(upload));
+
+    PendingClodTileUpload& submitted =
+        pendingClodTileUploads_.back();
+
+    ID3D12CommandList* commandLists[]{
+        submitted.commandList.Get()
+    };
+
+    copyQueue_->ExecuteCommandLists(
+        1,
+        commandLists);
+
+    const std::uint64_t fenceValue =
+        nextCopyFenceValue_++;
+
+    ThrowIfFailed(
+        copyQueue_->Signal(
+            copyFence_.Get(),
+            fenceValue),
+        "Signal CLOD attachment copy fence");
+
+    submitted.copyFenceValue = fenceValue;
+    pointBufferSizeBytes_ += submitted.sizeBytes;
+
+    return true;
+}
+
+bool D3D12Context::IsPointCloudTileClodUploadComplete(
+    PointCloudTileId tileId) const
+{
+    const auto uploadIterator =
+        std::find_if(
+            pendingClodTileUploads_.begin(),
+            pendingClodTileUploads_.end(),
+            [tileId](const PendingClodTileUpload& upload)
+            {
+                return upload.tileId == tileId;
+            });
+
+    return uploadIterator
+        != pendingClodTileUploads_.end()
+        && !uploadIterator->abandoned
+        && uploadIterator->copyFenceValue != 0
+        && copyFence_->GetCompletedValue()
+            >= uploadIterator->copyFenceValue;
+}
+
+bool D3D12Context::FinalizePointCloudTileClodUpload(
+    PointCloudTileId tileId)
+{
+    const auto uploadIterator =
+        std::find_if(
+            pendingClodTileUploads_.begin(),
+            pendingClodTileUploads_.end(),
+            [tileId](const PendingClodTileUpload& upload)
+            {
+                return upload.tileId == tileId;
+            });
+
+    if (uploadIterator == pendingClodTileUploads_.end()
+        || uploadIterator->abandoned
+        || uploadIterator->copyFenceValue == 0
+        || copyFence_->GetCompletedValue()
+            < uploadIterator->copyFenceValue)
+    {
+        return false;
+    }
+
+    const auto tileIterator =
+        std::find_if(
+            pointTiles_.begin(),
+            pointTiles_.end(),
+            [tileId](const GpuPointTile& tile)
+            {
+                return tile.id == tileId;
+            });
+
+    if (tileIterator == pointTiles_.end()
+        || tileIterator->clodSourceBuffer)
+    {
+        return false;
+    }
+
+    const std::uint32_t descriptorIndex =
+        AllocateClodTileDescriptor();
+
+    tileIterator->clodSourceBuffer =
+        std::move(uploadIterator->clodSourceBuffer);
+    tileIterator->uploadedClodPointCount =
+        uploadIterator->pointCount;
+    tileIterator->clodRootSpacing =
+        uploadIterator->rootSpacing;
+    tileIterator->clodSizeBytes =
+        uploadIterator->sizeBytes;
+    tileIterator->sizeBytes +=
+        uploadIterator->sizeBytes;
+    tileIterator->needsCopyToClodSourceTransition =
+        true;
+    tileIterator->clodSrvDescriptorIndex =
+        descriptorIndex;
+
+    CreateClodTileSourceView(*tileIterator);
+
+    if (clodSourceGeneration_
+        == std::numeric_limits<std::uint64_t>::max())
+    {
+        throw std::overflow_error(
+            "CLOD source generation overflow.");
+    }
+
+    ++clodSourceGeneration_;
+
+    pendingClodTileUploads_.erase(
+        uploadIterator);
+
+    return true;
+}
+
+bool D3D12Context::AbandonPointCloudTileClodUpload(
+    PointCloudTileId tileId)
+{
+    const auto uploadIterator =
+        std::find_if(
+            pendingClodTileUploads_.begin(),
+            pendingClodTileUploads_.end(),
+            [tileId](const PendingClodTileUpload& upload)
+            {
+                return upload.tileId == tileId;
+            });
+
+    if (uploadIterator == pendingClodTileUploads_.end())
+    {
+        return false;
+    }
+
+    uploadIterator->abandoned = true;
     return true;
 }
 
@@ -2099,6 +4166,34 @@ bool D3D12Context::RemovePointCloudTile(
         return false;
     }
 
+    // A late CLOD attachment may still be copying while the
+    // already-visible discrete tile is being removed.
+    const auto pendingClodIterator =
+        std::find_if(
+            pendingClodTileUploads_.begin(),
+            pendingClodTileUploads_.end(),
+            [tileId](const PendingClodTileUpload& upload)
+            {
+                return upload.tileId == tileId;
+            });
+
+    if (pendingClodIterator
+        != pendingClodTileUploads_.end())
+    {
+        pendingClodIterator->abandoned = true;
+    }
+
+    const bool removesClodSource =
+        tileIterator->clodSourceBuffer != nullptr;
+
+    if (removesClodSource
+        && clodSourceGeneration_
+            == std::numeric_limits<std::uint64_t>::max())
+    {
+        throw std::overflow_error(
+            "CLOD source generation overflow.");
+    }
+
     // Allocate vector capacity before changing any state.
     // If allocation fails, the active tile remains untouched.
     retiredPointTiles_.reserve(
@@ -2122,6 +4217,16 @@ bool D3D12Context::RemovePointCloudTile(
         std::move(
             tileIterator->pointBuffer);
 
+    retiredTile.clodSourceBuffer =
+        std::move(
+            tileIterator->clodSourceBuffer);
+
+    retiredTile.clodSrvDescriptorIndex =
+        tileIterator->clodSrvDescriptorIndex;
+
+    tileIterator->clodSrvDescriptorIndex =
+        InvalidClodDescriptorIndex;
+
     retiredTile.sizeBytes =
         tileIterator->sizeBytes;
 
@@ -2137,12 +4242,37 @@ bool D3D12Context::RemovePointCloudTile(
     pointTiles_.erase(
         tileIterator);
 
+    if (removesClodSource)
+    {
+        ++clodSourceGeneration_;
+    }
+
     return true;
+}
+
+bool D3D12Context::
+IsPointCloudTileReferencedByActiveClodReduction(
+    PointCloudTileId tileId) const noexcept
+{
+    if (tileId == 0
+        || !clodReductionCycle_.IsActive())
+    {
+        return false;
+    }
+
+    return std::any_of(
+        clodReductionCycle_.sources.begin(),
+        clodReductionCycle_.sources.end(),
+        [tileId](const ClodReductionSource& source)
+        {
+            return source.tileId == tileId;
+        });
 }
 
 void D3D12Context::CollectAbandonedPointUploads()
 {
-    if (pendingPointTileUploads_.empty()
+    if ((pendingPointTileUploads_.empty()
+        && pendingClodTileUploads_.empty())
         || !copyFence_)
     {
         return;
@@ -2183,6 +4313,39 @@ void D3D12Context::CollectAbandonedPointUploads()
     pendingPointTileUploads_.erase(
         firstRemainingUpload,
         pendingPointTileUploads_.end());
+
+    const auto firstRemainingClodUpload =
+        std::remove_if(
+            pendingClodTileUploads_.begin(),
+            pendingClodTileUploads_.end(),
+            [this, completedFenceValue](
+                const PendingClodTileUpload& upload)
+            {
+                if (!upload.abandoned
+                    || upload.copyFenceValue == 0
+                    || upload.copyFenceValue
+                        > completedFenceValue)
+                {
+                    return false;
+                }
+
+                if (upload.sizeBytes
+                    > pointBufferSizeBytes_)
+                {
+                    throw std::logic_error(
+                        "Abandoned CLOD upload memory "
+                        "accounting underflow.");
+                }
+
+                pointBufferSizeBytes_ -=
+                    upload.sizeBytes;
+
+                return true;
+            });
+
+    pendingClodTileUploads_.erase(
+        firstRemainingClodUpload,
+        pendingClodTileUploads_.end());
 }
 
 void D3D12Context::CollectRetiredPointTiles()
@@ -2207,6 +4370,13 @@ void D3D12Context::CollectRetiredPointTiles()
                     > completedFenceValue)
                 {
                     return false;
+                }
+
+                if (tile.clodSrvDescriptorIndex
+                    != InvalidClodDescriptorIndex)
+                {
+                    ReleaseClodTileDescriptor(
+                        tile.clodSrvDescriptorIndex);
                 }
 
                 pointBufferSizeBytes_ -=
@@ -2234,7 +4404,23 @@ void D3D12Context::ClearPointCloudTiles()
 
     pointTiles_.clear();
     pendingPointTileUploads_.clear();
+    pendingClodTileUploads_.clear();
     retiredPointTiles_.clear();
+    ResetClodTileDescriptorAllocator();
+
+    activeClodReductionSlotIndex_.reset();
+    nextClodReductionSlotIndex_ = 0;
+    clodDrawnLastFrame_ = false;
+
+    for (ClodReductionSlot& slot :
+        clodReductionSlots_)
+    {
+        slot.completionFenceValue = 0;
+        slot.expectedCandidateCount = 0;
+        slot.lastAcceptedPointCount = 0;
+        slot.lastOverflowPointCount = 0;
+        slot.hasValidResult = false;
+    }
 
     pointCount_ = 0;
     pointBufferSizeBytes_ = 0;
@@ -2329,6 +4515,7 @@ void D3D12Context::Shutdown() noexcept
 
     pointTiles_.clear();
     pendingPointTileUploads_.clear();
+    pendingClodTileUploads_.clear();
     retiredPointTiles_.clear();
     pointCount_ = 0;
     pointBufferSizeBytes_ = 0;
@@ -2373,6 +4560,37 @@ void D3D12Context::Shutdown() noexcept
     swapChain_.Reset();
     copyQueue_.Reset();
     commandQueue_.Reset();
+
+    for (ClodReductionSlot& slot :
+        clodReductionSlots_)
+    {
+        slot.pointBuffer.Reset();
+        slot.counterBuffer.Reset();
+        slot.counterReadback.Reset();
+
+        slot.capacity = 0;
+        slot.lastAcceptedPointCount = 0;
+        slot.lastOverflowPointCount = 0;
+
+        slot.pointBufferState =
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+        slot.counterBufferState =
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+
+    clodCounterResetUpload_.Reset();
+
+    freeClodTileDescriptorIndices_.clear();
+    clodDescriptorHeap_.Reset();
+    clodDescriptorSize_ = 0;
+
+    clodReductionPipelineState_.Reset();
+    clodReductionRootSignature_.Reset();
+    clodDrawCommandSignature_.Reset();
+    clodDrawPipelineState_.Reset();
+    clodQuadVertexBuffer_.Reset();
+    clodQuadVertexBufferView_ = {};
 
     device_.Reset();
     adapter_.Reset();
@@ -2430,6 +4648,79 @@ void D3D12Context::SetElevationRange(
 
     maximumElevation_ =
         maximumElevation;
+}
+
+void D3D12Context::SetClodFactor(
+    float factor)
+{
+    if (!std::isfinite(factor)
+        || factor <= 0.0f)
+    {
+        throw std::invalid_argument(
+            "CLOD factor must be finite and "
+            "greater than zero.");
+    }
+
+    clodFactor_ = factor;
+}
+
+std::uint32_t
+D3D12Context::
+GetClodSelectedPointCount() const noexcept
+{
+    if (!activeClodReductionSlotIndex_)
+    {
+        return 0;
+    }
+
+    const ClodReductionSlot& slot =
+        clodReductionSlots_[
+            *activeClodReductionSlotIndex_];
+
+    return slot.hasValidResult
+        && slot.sourceGeneration
+            == clodSourceGeneration_
+        ? slot.lastAcceptedPointCount
+        : 0;
+}
+
+std::uint32_t
+D3D12Context::
+GetClodOverflowPointCount() const noexcept
+{
+    if (!activeClodReductionSlotIndex_)
+    {
+        return 0;
+    }
+
+    const ClodReductionSlot& slot =
+        clodReductionSlots_[
+            *activeClodReductionSlotIndex_];
+
+    return slot.hasValidResult
+        && slot.sourceGeneration
+            == clodSourceGeneration_
+        ? slot.lastOverflowPointCount
+        : 0;
+}
+
+std::uint64_t
+D3D12Context::
+GetClodReductionBufferSizeBytes() const noexcept
+{
+    std::uint64_t sizeBytes = 0;
+
+    for (const ClodReductionSlot& slot :
+        clodReductionSlots_)
+    {
+        sizeBytes +=
+            static_cast<std::uint64_t>(slot.capacity)
+            * sizeof(ReducedClodPoint);
+
+        sizeBytes += sizeof(ClodReductionControl);
+    }
+
+    return sizeBytes;
 }
 
 D3D12Context::~D3D12Context()
