@@ -385,6 +385,36 @@ namespace
         }
     }
 
+    std::uint8_t ConvertLasColorChannel(
+        laszip_U16 value)
+    {
+        // LAS RGB channels are 16 bit. Most producers expand
+        // 8 bit imagery across that range, so map it back to the
+        // 8 bit channel stored by GpuPoint.
+        return static_cast<std::uint8_t>(
+            std::min<laszip_U32>(
+                (static_cast<laszip_U32>(value) + 128u)
+                    / 257u,
+                255u));
+    }
+
+    std::uint32_t GetPointColor(
+        const laszip_point& point,
+        bool hasRgb,
+        std::uint8_t classification)
+    {
+        if (hasRgb)
+        {
+            return PackRgba8(
+                ConvertLasColorChannel(point.rgb[0]),
+                ConvertLasColorChannel(point.rgb[1]),
+                ConvertLasColorChannel(point.rgb[2]));
+        }
+
+        return GetClassificationColor(
+            classification);
+    }
+
     bool FixedStringEquals(
         const char* value,
         std::size_t capacity,
@@ -891,7 +921,9 @@ LasPointCloudLoader::Load(
                 localY,
                 localZ
             },
-            GetClassificationColor(
+            GetPointColor(
+                *sourcePoint,
+                data.metadata.attributes.hasRgb,
                 classification)
         };
 

@@ -22,7 +22,7 @@ using PointCloudTileId = std::uint64_t;
 
 enum class PointColorMode : std::uint32_t
 {
-    Classification = 0,
+    SourceColor = 0,
     Elevation = 1
 };
 
@@ -202,6 +202,13 @@ public:
     }
 
     [[nodiscard]]
+    std::uint64_t
+        GetClodReductionSourceBudgetPerFrame() const noexcept
+    {
+        return clodReductionSourcePointBudgetPerFrame_;
+    }
+
+    [[nodiscard]]
     std::uint32_t
         GetClodSelectedPointCount() const noexcept;
 
@@ -250,10 +257,8 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource>
             pointBuffer;
 
-        // Two uint counters:
-        //
-        // byte 0: accepted count
-        // byte 4: overflow count
+        // Indirect D3D12_DRAW_ARGUMENTS followed by the overflow
+        // counter. InstanceCount is the accepted point count.
         Microsoft::WRL::ComPtr<ID3D12Resource>
             counterBuffer;
 
@@ -273,6 +278,10 @@ private:
         // output overflowed, it provides the baseline for the
         // following cycle's automatic quality reduction.
         float resultClodFactor = 1.0f;
+
+        // Frozen view used to build this completed result.
+        DirectX::XMFLOAT3 cameraPosition{};
+        DirectX::XMFLOAT4X4 viewProjection{};
 
         std::uint64_t sourceGeneration = 0;
 
@@ -667,14 +676,13 @@ private:
     //
     // This limits compute work, not the number of points that
     // survive into the reduced output.
-    static constexpr std::uint64_t
-        ClodReductionSourcePointBudgetPerFrame =
+    std::uint64_t
+        clodReductionSourcePointBudgetPerFrame_ =
         1'000'000;
 
-    // Persistent eight-byte zero source used to reset:
-    //
-    // accepted count = 0
-    // overflow count = 0
+    // Persistent indirect-argument template used to reset the
+    // accepted instance count and overflow count while retaining
+    // six vertices per point quad.
     Microsoft::WRL::ComPtr<ID3D12Resource>
         clodCounterResetUpload_;
 

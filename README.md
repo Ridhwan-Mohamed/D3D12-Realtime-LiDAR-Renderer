@@ -100,7 +100,7 @@ Unloaded -> Queued -> Loading -> ReadyForUpload
 | `Shift` | Move faster |
 | `Ctrl` | Move precisely |
 | `R` | Frame the complete dataset |
-| `1` | Classification colours |
+| `1` | Source RGB colours (classification fallback when RGB is absent) |
 | `2` | Elevation colours |
 | `C` | Switch between Discrete and CLOD rendering |
 | `[` / `]` | Increase / decrease CLOD density |

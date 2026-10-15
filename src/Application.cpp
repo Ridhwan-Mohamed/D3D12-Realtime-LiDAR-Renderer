@@ -2194,7 +2194,7 @@ void Application::UpdateFrameStatistics(
         : 0.0;
 
     const wchar_t* colorModeName =
-        L"Classification";
+        L"Source Color";
 
     if (graphics_.GetPointColorMode()
         == PointColorMode::Elevation)
@@ -2337,7 +2337,13 @@ void Application::UpdateFrameStatistics(
             << std::fixed
             << std::setprecision(3)
             << L" factor "
-            << graphics_.GetClodFactor();
+            << graphics_.GetClodFactor()
+            << std::setprecision(0)
+            << L" scan "
+            << graphics_.
+                GetClodReductionSourceBudgetPerFrame()
+                / 1000
+            << L"K";
 
         const std::uint64_t reductionTotal =
             graphics_.GetClodReductionTotalPointCount();
@@ -2518,7 +2524,7 @@ void Application::UpdateCamera(
     if (GetAsyncKeyState('1') & 0x8000)
     {
         graphics_.SetPointColorMode(
-            PointColorMode::Classification);
+            PointColorMode::SourceColor);
     }
 
     if (GetAsyncKeyState('2') & 0x8000)

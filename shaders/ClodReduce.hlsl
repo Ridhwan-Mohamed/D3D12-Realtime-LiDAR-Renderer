@@ -163,92 +163,135 @@ bool IsUsefulDetail(
     return pointSpacing >= targetSpacing;
 }
 
-bool TryAllocateOutputIndex(
-    out uint outputIndex)
-{
-    uint observedCount =
-        ReductionControl.Load(4);
-
-    while (observedCount < outputCapacity)
-    {
-        uint originalCount = 0;
-
-        ReductionControl.InterlockedCompareExchange(
-            4,
-            observedCount,
-            observedCount + 1,
-            originalCount);
-
-        if (originalCount == observedCount)
-        {
-            outputIndex = observedCount;
-            return true;
-        }
-
-        observedCount = originalCount;
-    }
-
-    outputIndex = 0;
-    return false;
-}
+groupshared uint GroupAcceptedPointCount;
+groupshared uint GroupOutputBase;
 
 [numthreads(256, 1, 1)]
 void CSMain(
-    uint3 dispatchThreadId
-        : SV_DispatchThreadID)
+    uint3 dispatchThreadId : SV_DispatchThreadID,
+    uint groupThreadIndex : SV_GroupIndex)
 {
+    if (groupThreadIndex == 0)
+    {
+        GroupAcceptedPointCount = 0;
+        GroupOutputBase = 0;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
     // Index inside this particular chunk.
     const uint chunkPointIndex =
         dispatchThreadId.x;
 
-    // The final thread group may contain extra threads.
-    if (chunkPointIndex >= sourcePointCount)
+    bool accepted = false;
+    ClodPoint sourcePoint;
+    float pointSpacing = 0.0f;
+
+    // All lanes must reach the group barriers below, including
+    // unused lanes in the final partial thread group.
+    if (chunkPointIndex < sourcePointCount)
     {
-        return;
+        // Convert the chunk-local index into an index inside
+        // the complete source array belonging to this tile.
+        const uint sourceIndex =
+            sourceFirstPoint
+            + chunkPointIndex;
+
+        sourcePoint =
+            SourcePoints[sourceIndex];
+
+        float3 normalizedDevicePosition;
+
+        if (TryProjectToReductionView(
+                sourcePoint.position,
+                normalizedDevicePosition))
+        {
+            pointSpacing =
+                CalculatePointSpacing(
+                    sourcePoint);
+
+            accepted =
+                IsUsefulDetail(
+                    sourcePoint.position,
+                    normalizedDevicePosition.xy,
+                    pointSpacing);
+        }
     }
 
-    // Convert the chunk-local index into an index inside
-    // the complete source array belonging to this tile.
-    const uint sourceIndex =
-        sourceFirstPoint
-        + chunkPointIndex;
+    // Compact accepted lanes locally. This atomic targets fast
+    // group-shared memory instead of one globally contended value.
+    uint groupOutputIndex = 0;
 
-    const ClodPoint sourcePoint =
-        SourcePoints[sourceIndex];
-
-    float3 normalizedDevicePosition;
-
-    if (!TryProjectToReductionView(
-    sourcePoint.position,
-    normalizedDevicePosition))
+    if (accepted)
     {
-        return;
+        InterlockedAdd(
+            GroupAcceptedPointCount,
+            1,
+            groupOutputIndex);
     }
 
-    const float pointSpacing =
-    CalculatePointSpacing(
-        sourcePoint);
+    GroupMemoryBarrierWithGroupSync();
 
-    if (!IsUsefulDetail(
-        sourcePoint.position,
-        normalizedDevicePosition.xy,
-        pointSpacing))
+    // One lane reserves one contiguous output block for the entire
+    // group. At most one global accepted-count atomic is issued for
+    // every 256 source points.
+    if (groupThreadIndex == 0
+        && GroupAcceptedPointCount != 0)
     {
-        return;
-    }
-
-    uint outputIndex = 0;
-
-    if (!TryAllocateOutputIndex(
-        outputIndex))
-    {
-        uint previousOverflowCount = 0;
+        uint outputBase = 0;
 
         ReductionControl.InterlockedAdd(
-            16,
-            1,
-            previousOverflowCount);
+            4,
+            GroupAcceptedPointCount,
+            outputBase);
 
+        GroupOutputBase = outputBase;
+
+        const uint writablePointCount =
+            outputBase < outputCapacity
+            ? min(
+                GroupAcceptedPointCount,
+                outputCapacity - outputBase)
+            : 0;
+
+        const uint overflowPointCount =
+            GroupAcceptedPointCount
+            - writablePointCount;
+
+        if (overflowPointCount != 0)
+        {
+            uint previousOverflowCount = 0;
+
+            ReductionControl.InterlockedAdd(
+                16,
+                overflowPointCount,
+                previousOverflowCount);
+
+            // InterlockedAdd reserves the group as one block. Clamp
+            // the indirect instance count when that block crosses the
+            // output boundary.
+            uint previousAcceptedCount = 0;
+
+            ReductionControl.InterlockedMin(
+                4,
+                outputCapacity,
+                previousAcceptedCount);
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (!accepted)
+    {
+        return;
+    }
+
+    const uint outputIndex =
+        GroupOutputBase
+        + groupOutputIndex;
+
+    if (outputIndex >= outputCapacity)
+    {
         return;
     }
 

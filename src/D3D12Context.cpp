@@ -87,7 +87,7 @@ namespace
     struct ClodReductionControl
     {
         D3D12_DRAW_ARGUMENTS drawArguments{
-            6, // Six vertices form one quad.
+            6, // Six vertices form one point quad.
             0, // Compute increments one instance per accepted point.
             0, // StartVertexLocation
             0  // StartInstanceLocation
@@ -234,6 +234,7 @@ void D3D12Context::SelectAdapter()
             "Query IDXGIAdapter4");
 
         adapterName_ = description.Description;
+
         return;
     }
 
@@ -1226,8 +1227,8 @@ CreateClodReductionResources(
         GetDescriptorHandleIncrementSize(
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    // Persistent zero-filled source used to reset either
-    // slot's counter buffer through CopyBufferRegion.
+    // Persistent indirect-argument template used to reset either
+    // slot's control buffer through CopyBufferRegion.
     clodCounterResetUpload_ =
         CreateBuffer(
             counterBufferSize,
@@ -1831,6 +1832,7 @@ void D3D12Context::ReadGpuTimingResult(
             * 1000.0
             / static_cast<double>(
                 gpuTimestampFrequency_);
+
     }
 
     frame.gpuTimingPending = false;
@@ -2051,14 +2053,97 @@ D3D12Context::RecordClodReduction(
 {
     constexpr std::uint32_t threadsPerGroup = 256;
 
-    static_assert(
-        ClodReductionSourcePointBudgetPerFrame
-        <= std::numeric_limits<std::uint32_t>::max());
+    const DirectX::XMFLOAT3 currentCameraPosition =
+        camera.GetPosition();
+
+    DirectX::XMFLOAT4X4 currentViewProjection{};
+
+    DirectX::XMStoreFloat4x4(
+        &currentViewProjection,
+        DirectX::XMMatrixTranspose(
+            camera.GetViewProjectionMatrix()));
 
     bool startedCycleThisFrame = false;
 
     if (!clodReductionCycle_.IsActive())
     {
+        // Do not start another build while a complete result is
+        // merely waiting for its fence/readback to become visible.
+        const bool resultPending =
+            std::any_of(
+                clodReductionSlots_.begin(),
+                clodReductionSlots_.end(),
+                [](const ClodReductionSlot& slot)
+                {
+                    return slot.completionFenceValue != 0;
+                });
+
+        if (resultPending)
+        {
+            return std::nullopt;
+        }
+
+        // A fixed view can reuse its last complete result forever.
+        // Tiny input jitter should not continuously wake compute.
+        if (activeClodReductionSlotIndex_)
+        {
+            const ClodReductionSlot& activeSlot =
+                clodReductionSlots_[
+                    *activeClodReductionSlotIndex_];
+
+            const float deltaX =
+                currentCameraPosition.x
+                - activeSlot.cameraPosition.x;
+            const float deltaY =
+                currentCameraPosition.y
+                - activeSlot.cameraPosition.y;
+            const float deltaZ =
+                currentCameraPosition.z
+                - activeSlot.cameraPosition.z;
+
+            const float positionDeltaSquared =
+                deltaX * deltaX
+                + deltaY * deltaY
+                + deltaZ * deltaZ;
+
+            const float* currentMatrix =
+                &currentViewProjection._11;
+            const float* resultMatrix =
+                &activeSlot.viewProjection._11;
+
+            float maximumMatrixDelta = 0.0f;
+
+            for (std::size_t elementIndex = 0;
+                elementIndex < 16;
+                ++elementIndex)
+            {
+                maximumMatrixDelta =
+                    std::max(
+                        maximumMatrixDelta,
+                        std::abs(
+                            currentMatrix[elementIndex]
+                            - resultMatrix[elementIndex]));
+            }
+
+            const bool sameView =
+                positionDeltaSquared <= 0.0025f
+                && maximumMatrixDelta <= 0.0005f;
+
+            const bool sameQuality =
+                std::abs(
+                    activeSlot.resultClodFactor
+                    - clodFactor_) <= 0.0001f;
+
+            if (activeSlot.hasValidResult
+                && activeSlot.sourceGeneration
+                    == clodSourceGeneration_
+                && sameView
+                && sameQuality)
+            {
+                return std::nullopt;
+            }
+        }
+
         std::vector<ClodReductionSource> sources;
         std::uint64_t totalSourcePointCount = 0;
 
@@ -2142,12 +2227,10 @@ D3D12Context::RecordClodReduction(
             clodSourceGeneration_;
 
         clodReductionCycle_.cameraPosition =
-            camera.GetPosition();
+            currentCameraPosition;
 
-        DirectX::XMStoreFloat4x4(
-            &clodReductionCycle_.viewProjection,
-            DirectX::XMMatrixTranspose(
-                camera.GetViewProjectionMatrix()));
+        clodReductionCycle_.viewProjection =
+            currentViewProjection;
 
         clodReductionCycle_.clodFactor =
             clodFactor_;
@@ -2265,7 +2348,7 @@ D3D12Context::RecordClodReduction(
             slot.outputUavDescriptorIndex));
 
     std::uint64_t remainingFrameBudget =
-        ClodReductionSourcePointBudgetPerFrame;
+        clodReductionSourcePointBudgetPerFrame_;
 
     while (remainingFrameBudget > 0
         && clodReductionCycle_.sourceIndex
@@ -2456,6 +2539,12 @@ D3D12Context::RecordClodReduction(
     slot.resultClodFactor =
         clodReductionCycle_.clodFactor;
 
+    slot.cameraPosition =
+        clodReductionCycle_.cameraPosition;
+
+    slot.viewProjection =
+        clodReductionCycle_.viewProjection;
+
     slot.sourceGeneration =
         clodReductionCycle_.sourceGeneration;
 
@@ -2559,6 +2648,7 @@ void D3D12Context::CollectCompletedClodReductions()
                     clodFactor_,
                     recoveryFactor);
         }
+
 
         if (slot.lastAcceptedPointCount
         > slot.capacity
