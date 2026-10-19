@@ -32,6 +32,13 @@ struct PointCloudDrawRange
     std::uint32_t pointCount = 0;
 };
 
+struct LodDebugBox
+{
+    DirectX::XMFLOAT3 minimum{};
+    DirectX::XMFLOAT3 maximum{};
+    std::uint32_t color = 0;
+};
+
 class D3D12Context
 {
 public:
@@ -39,7 +46,8 @@ public:
         HWND window,
         std::uint32_t width,
         std::uint32_t height,
-        std::uint32_t clodOutputCapacity);
+        std::uint32_t clodOutputCapacity,
+        std::uint32_t clodTargetPointCount);
 
     ~D3D12Context();
 
@@ -104,6 +112,17 @@ public:
         std::span<
         const PointCloudDrawRange>
         drawRanges);
+
+    [[nodiscard]]
+    bool SetPointCloudTileClodDebugRange(
+        PointCloudTileId tileId,
+        PointCloudDrawRange drawRange);
+
+    void SetClodLevelDebugEnabled(
+        bool enabled) noexcept;
+
+    void SetLodDebugBoxes(
+        std::span<const LodDebugBox> boxes);
 
     [[nodiscard]]
     bool RemovePointCloudTile(
@@ -402,6 +421,7 @@ private:
     bool clodDrawnLastFrame_ = false;
 
     float clodFactor_ = 1.0f;
+    std::uint32_t clodTargetPointCount_ = 0;
 
     std::uint64_t clodSourceGeneration_ = 0;
 
@@ -415,6 +435,13 @@ private:
             cameraBuffer;
 
         std::uint8_t* mappedCameraData = nullptr;
+
+        Microsoft::WRL::ComPtr<ID3D12Resource>
+            lodDebugLineBuffer;
+
+        std::uint8_t* mappedLodDebugLineData = nullptr;
+
+        std::uint64_t lodDebugLineCapacityBytes = 0;
 
         std::uint64_t fenceValue = 0;
 
@@ -451,6 +478,8 @@ private:
 
         std::vector<PointCloudDrawRange>
             drawRanges;
+
+        PointCloudDrawRange clodDebugDrawRange{};
 
         // Number of GpuPoint records in pointBuffer.
         std::uint32_t uploadedPointCount = 0;
@@ -645,6 +674,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pipelineState_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> clodDrawPipelineState_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> debugLinePipelineState_;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> dsvHeap_;
     Microsoft::WRL::ComPtr<ID3D12Resource> depthBuffer_;
 
@@ -690,6 +720,11 @@ private:
     std::vector<PendingPointTileUpload> pendingPointTileUploads_;
     std::vector<PendingClodTileUpload> pendingClodTileUploads_;
     std::uint64_t pointCount_ = 0;
+
+    bool clodLevelDebugEnabled_ = false;
+    std::uint64_t clodDebugSelectedPointCount_ = 0;
+
+    std::vector<GpuPoint> lodDebugLineVertices_;
 
     D3D12_VIEWPORT viewport_{};
     D3D12_RECT scissorRectangle_{};

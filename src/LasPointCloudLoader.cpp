@@ -386,11 +386,17 @@ namespace
     }
 
     std::uint8_t ConvertLasColorChannel(
-        laszip_U16 value)
+        laszip_U16 value,
+        bool usesEightBitChannels)
     {
-        // LAS RGB channels are 16 bit. Most producers expand
-        // 8 bit imagery across that range, so map it back to the
-        // 8 bit channel stored by GpuPoint.
+        // LAS reserves 16 bits per RGB channel, but producers use
+        // two common conventions: true 0..65535 values, or ordinary
+        // 0..255 imagery stored directly in the 16-bit fields.
+        if (usesEightBitChannels)
+        {
+            return static_cast<std::uint8_t>(value);
+        }
+
         return static_cast<std::uint8_t>(
             std::min<laszip_U32>(
                 (static_cast<laszip_U32>(value) + 128u)
@@ -405,10 +411,24 @@ namespace
     {
         if (hasRgb)
         {
+            // If every channel fits in one byte, treat the point as
+            // direct 8-bit RGB. Otherwise scale all three channels
+            // together from LAS's full 16-bit range.
+            const bool usesEightBitChannels =
+                point.rgb[0] <= 255u
+                && point.rgb[1] <= 255u
+                && point.rgb[2] <= 255u;
+
             return PackRgba8(
-                ConvertLasColorChannel(point.rgb[0]),
-                ConvertLasColorChannel(point.rgb[1]),
-                ConvertLasColorChannel(point.rgb[2]));
+                ConvertLasColorChannel(
+                    point.rgb[0],
+                    usesEightBitChannels),
+                ConvertLasColorChannel(
+                    point.rgb[1],
+                    usesEightBitChannels),
+                ConvertLasColorChannel(
+                    point.rgb[2],
+                    usesEightBitChannels));
         }
 
         return GetClassificationColor(

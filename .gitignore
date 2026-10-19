@@ -29,6 +29,11 @@ datasets/
 # Private project notes
 docs/
 
+# Local captures and benchmark output
+videos/
+PointCloudRenderer_Benchmark.txt
+photos/*.png
+
 # Local archives and scratch files
 *.zip
 *.7z

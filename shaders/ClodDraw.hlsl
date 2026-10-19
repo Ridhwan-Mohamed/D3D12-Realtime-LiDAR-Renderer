@@ -16,7 +16,8 @@ cbuffer CameraConstants : register(b0)
 
     float clodPeripheralDensityFalloff;
     float clodMinimumPeripheralDensity;
-    float2 clodPeripheralPadding;
+    float clodProjectionScale;
+    float clodMinimumPointSizeWorld;
 };
 
 struct VertexInput
@@ -154,11 +155,23 @@ VertexOutput VSMain(VertexInput input)
             - targetSpacing)
         / blendSpacingWidth);
 
+    // targetSpacing gives the normal CLOD footprint. Once every
+    // available source point is visible, finite scanner density can
+    // still leave holes. A small world-space floor grows in pixels as
+    // the camera approaches, like the minimum scanner footprint
+    // suggested by the CLOD paper.
+    const float minimumWorldFootprintPixels =
+        clodMinimumPointSizeWorld
+        * clodProjectionScale
+        / max(distanceToCamera, 0.000001f);
+
     const float fullPointSizePixels =
     max(
-        clodPointSizePixels
-            / peripheralDensity,
-        clodMinimumPointSizePixels);
+        max(
+            clodPointSizePixels
+                / peripheralDensity,
+            clodMinimumPointSizePixels),
+        minimumWorldFootprintPixels);
 
     const float pointSizePixels =
         fullPointSizePixels

@@ -206,6 +206,8 @@ int Application::Run(int showCommand)
         clientWidth_,
         clientHeight_,
         static_cast<std::uint32_t>(
+            ClodOutputCapacity),
+        static_cast<std::uint32_t>(
             MaximumDrawnPoints));
 
     windowTitlePrefix_ =
@@ -391,6 +393,7 @@ int Application::Run(int showCommand)
 
             UpdateTilePriorities();
             UpdateTileResidency(deltaSeconds);
+            UpdateClodLevelDebugSelection();
 
             // Keep the discrete fallback current while CLOD is
             // preparing, but stop paying for CPU hierarchy
@@ -401,6 +404,10 @@ int Application::Run(int showCommand)
                     == PointRenderMode::Discrete)
             {
                 UpdatePointDetailSelection();
+            }
+            else
+            {
+                graphics_.SetLodDebugBoxes({});
             }
 
             graphics_.Render(
@@ -1727,6 +1734,7 @@ void Application::UpdatePointDetailSelection()
 
     selectedDrawRangeCount_ = 0;
     frustumCulledNodeCount_ = 0;
+    lodDebugBoxes_.clear();
 
     if (fullDetailMode_)
     {
@@ -1773,6 +1781,7 @@ void Application::UpdatePointDetailSelection()
                 std::uint8_t{ 0 });
         }
 
+        graphics_.SetLodDebugBoxes({});
         return;
     }
 
@@ -2106,10 +2115,12 @@ void Application::UpdatePointDetailSelection()
                 continue;
             }
 
-            const PointRange& range =
+            const PointHierarchyNode& node =
                 state.hierarchy.nodes[
-                    nodeIndex].
-                representativePoints;
+                    nodeIndex];
+
+            const PointRange& range =
+                node.representativePoints;
 
             state.selectedDrawRanges.push_back({
                 range.firstPoint,
@@ -2117,6 +2128,17 @@ void Application::UpdatePointDetailSelection()
                 });
 
             ++selectedDrawRangeCount_;
+
+            if (showLodNodeBounds_)
+            {
+                lodDebugBoxes_.push_back({
+                    node.boundsMinimum,
+                    node.boundsMaximum,
+                    node.IsLeaf()
+                        ? PackRgba8(64, 255, 96)
+                        : PackRgba8(255, 64, 64)
+                    });
+            }
 
         }
 
@@ -2134,6 +2156,56 @@ void Application::UpdatePointDetailSelection()
 
         state.refinedNodeFlags.swap(
             state.nextRefinedNodeFlags);
+    }
+
+    graphics_.SetLodDebugBoxes(
+        lodDebugBoxes_);
+}
+
+void Application::UpdateClodLevelDebugSelection()
+{
+    graphics_.SetClodLevelDebugEnabled(
+        clodDebugLevel_.has_value());
+
+    for (TileResidencyState& state :
+        tileResidencyStates_)
+    {
+        if (!state.IsResident()
+            || !state.gpuTileId)
+        {
+            continue;
+        }
+
+        PointCloudDrawRange drawRange{};
+
+        if (clodDebugLevel_
+            && state.clodLifecycleState
+                == ClodLifecycleState::Resident
+            && *clodDebugLevel_
+                < state.hierarchy.
+                    clodLevelRanges.size())
+        {
+            const PointRange& levelRange =
+                state.hierarchy.clodLevelRanges[
+                    *clodDebugLevel_];
+
+            drawRange = {
+                levelRange.firstPoint,
+                levelRange.pointCount
+            };
+        }
+
+        const bool updated =
+            graphics_.SetPointCloudTileClodDebugRange(
+                *state.gpuTileId,
+                drawRange);
+
+        if (!updated)
+        {
+            throw std::logic_error(
+                "CLOD debug tile does not exist "
+                "in the renderer.");
+        }
     }
 }
 
@@ -2196,8 +2268,9 @@ void Application::UpdateFrameStatistics(
     const wchar_t* colorModeName =
         L"Source Color";
 
-    if (graphics_.GetPointColorMode()
-        == PointColorMode::Elevation)
+    if (!clodDebugLevel_
+        && graphics_.GetPointColorMode()
+            == PointColorMode::Elevation)
     {
         colorModeName =
             L"Elevation";
@@ -2253,17 +2326,27 @@ void Application::UpdateFrameStatistics(
             PointMemoryBudgetBytes)
         / bytesPerMebibyte;
 
-    const wchar_t* pointRenderModeName =
+    std::wstring pointRenderModeName =
         L"Discrete";
 
     if (requestedPointRenderMode_
         == PointRenderMode::Continuous)
     {
-        pointRenderModeName =
-            activePointRenderMode_
-            == PointRenderMode::Continuous
-            ? L"CLOD"
-            : L"CLOD unavailable - Discrete active";
+        if (activePointRenderMode_
+            == PointRenderMode::Continuous)
+        {
+            pointRenderModeName =
+                clodDebugLevel_
+                ? L"CLOD level "
+                    + std::to_wstring(
+                        *clodDebugLevel_)
+                : L"CLOD";
+        }
+        else
+        {
+            pointRenderModeName =
+                L"CLOD unavailable - Discrete active";
+        }
     }
 
     const wchar_t* detailModeName =
@@ -2385,6 +2468,13 @@ void Application::UpdateFrameStatistics(
             << selectedDrawRangeCount_
             << L" | Culled "
             << frustumCulledNodeCount_;
+
+        if (showLodNodeBounds_)
+        {
+            title
+                << L" | Boxes "
+                << lodDebugBoxes_.size();
+        }
     }
     else
     {
@@ -2446,6 +2536,91 @@ void Application::UpdateCamera(
     detailModeKeyWasDown_ =
         detailModeKeyIsDown;
 
+    const bool clodLevelDebugKeyIsDown =
+        (GetAsyncKeyState('V') & 0x8000)
+        != 0;
+
+    if (benchmarkPhase_ == BenchmarkPhase::Idle
+        && clodLevelDebugKeyIsDown
+        && !clodLevelDebugKeyWasDown_)
+    {
+        std::optional<std::uint32_t>
+            maximumAvailableLevel;
+
+        for (const TileResidencyState& state :
+            tileResidencyStates_)
+        {
+            if (state.clodLifecycleState
+                    != ClodLifecycleState::Resident
+                || state.hierarchy.
+                    clodLevelRanges.empty())
+            {
+                continue;
+            }
+
+            const std::uint32_t tileMaximumLevel =
+                static_cast<std::uint32_t>(
+                    state.hierarchy.
+                        clodLevelRanges.size()
+                    - 1);
+
+            maximumAvailableLevel =
+                maximumAvailableLevel
+                ? std::max(
+                    *maximumAvailableLevel,
+                    tileMaximumLevel)
+                : tileMaximumLevel;
+        }
+
+        if (maximumAvailableLevel)
+        {
+            if (!clodDebugLevel_)
+            {
+                clodDebugLevel_ = 0;
+                requestedPointRenderMode_ =
+                    PointRenderMode::Continuous;
+            }
+            else if (*clodDebugLevel_
+                < *maximumAvailableLevel)
+            {
+                ++*clodDebugLevel_;
+                requestedPointRenderMode_ =
+                    PointRenderMode::Continuous;
+            }
+            else
+            {
+                clodDebugLevel_.reset();
+            }
+        }
+    }
+
+    clodLevelDebugKeyWasDown_ =
+        clodLevelDebugKeyIsDown;
+
+    const bool lodNodeBoundsKeyIsDown =
+        (GetAsyncKeyState('O') & 0x8000)
+        != 0;
+
+    if (benchmarkPhase_ == BenchmarkPhase::Idle
+        && lodNodeBoundsKeyIsDown
+        && !lodNodeBoundsKeyWasDown_)
+    {
+        showLodNodeBounds_ =
+            !showLodNodeBounds_;
+
+        if (showLodNodeBounds_)
+        {
+            clodDebugLevel_.reset();
+            requestedPointRenderMode_ =
+                PointRenderMode::Discrete;
+            activePointRenderMode_ =
+                PointRenderMode::Discrete;
+        }
+    }
+
+    lodNodeBoundsKeyWasDown_ =
+        lodNodeBoundsKeyIsDown;
+
     const bool pointRenderModeKeyIsDown =
         (GetAsyncKeyState('C') & 0x8000)
         != 0;
@@ -2467,6 +2642,8 @@ void Application::UpdateCamera(
 
             activePointRenderMode_ =
                 PointRenderMode::Discrete;
+
+            clodDebugLevel_.reset();
         }
     }
 

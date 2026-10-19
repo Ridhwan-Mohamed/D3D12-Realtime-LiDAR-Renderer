@@ -151,7 +151,7 @@ private:
 
     static constexpr std::uint64_t
         PointMemoryBudgetBytes =
-        3ull * 1024ull * 1024ull * 1024ull;
+        5ull * 1024ull * 1024ull * 1024ull;
 
     static LRESULT CALLBACK WindowProcedure(
         HWND window,
@@ -254,6 +254,7 @@ private:
     bool TryQueueNextTileLoad();
     void ValidateTileResidency() const;
     void UpdatePointDetailSelection();
+    void UpdateClodLevelDebugSelection();
     std::vector<std::size_t> tilePriorityOrder_;
     std::size_t wantedTileCount_ = 0;
     std::uint64_t wantedPointBytes_ = 0;
@@ -264,6 +265,7 @@ private:
     static constexpr float RefinePointSpacingPixels = 2.2f;
     static constexpr float CoarsenPointSpacingPixels = 1.8f;
     static constexpr std::uint64_t MaximumDrawnPoints = 3'500'000;
+    static constexpr std::uint64_t ClodOutputCapacity = 4'250'000;
     PointRenderMode requestedPointRenderMode_ =
         PointRenderMode::Discrete;
 
@@ -276,6 +278,14 @@ private:
 
     bool fullDetailMode_ = false;
     bool detailModeKeyWasDown_ = false;
+
+    std::optional<std::uint32_t>
+        clodDebugLevel_;
+    bool clodLevelDebugKeyWasDown_ = false;
+
+    bool showLodNodeBounds_ = false;
+    bool lodNodeBoundsKeyWasDown_ = false;
+    std::vector<LodDebugBox> lodDebugBoxes_;
 
     std::size_t selectedDrawRangeCount_ = 0;
     std::size_t frustumCulledNodeCount_ = 0;

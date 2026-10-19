@@ -20,6 +20,8 @@
 #include "ClodReduceCS.h"
 #include "ClodDrawVS.h"
 #include "ClodDrawPS.h"
+#include "DebugLinesVS.h"
+#include "DebugLinesPS.h"
 #include "ReducedClodPoint.h"
 
 namespace
@@ -47,7 +49,14 @@ namespace
 
         float clodPeripheralDensityFalloff = 0.5f;
         float clodMinimumPeripheralDensity = 0.3f;
-        DirectX::XMFLOAT2 clodPeripheralPadding{};
+
+        // Converts a world-space diameter at the current camera
+        // distance into pixels. The minimum world-space footprint
+        // lets splats grow at close range after every source point
+        // is already visible, filling holes caused by finite scanner
+        // density.
+        float clodProjectionScale = 1.0f;
+        float clodMinimumPointSizeWorld = 0.005f;
     };
 
     static_assert(
@@ -125,8 +134,19 @@ void D3D12Context::Initialize(
     HWND window,
     std::uint32_t width,
     std::uint32_t height,
-    std::uint32_t clodOutputCapacity)
+    std::uint32_t clodOutputCapacity,
+    std::uint32_t clodTargetPointCount)
 {
+    if (clodTargetPointCount == 0
+        || clodTargetPointCount > clodOutputCapacity)
+    {
+        throw std::invalid_argument(
+            "CLOD target point count must be positive and "
+            "must not exceed its output capacity.");
+    }
+
+    clodTargetPointCount_ = clodTargetPointCount;
+
     EnableDebugLayer();
     CreateFactory();
     SelectAdapter();
@@ -748,6 +768,43 @@ void D3D12Context::CreateGraphicsPipeline()
 
     clodDrawPipelineState_->SetName(
         L"CLOD Splat Graphics Pipeline");
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC
+        debugLinePipelineDescription =
+        pipelineDescription;
+
+    debugLinePipelineDescription.VS = {
+        g_debugLinesVertexShader,
+        sizeof(g_debugLinesVertexShader)
+    };
+
+    debugLinePipelineDescription.PS = {
+        g_debugLinesPixelShader,
+        sizeof(g_debugLinesPixelShader)
+    };
+
+    debugLinePipelineDescription.
+        PrimitiveTopologyType =
+        D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+
+    // Draw every selected box edge as an overlay so the node
+    // structure remains readable through dense point coverage.
+    debugLinePipelineDescription.
+        DepthStencilState.DepthEnable = FALSE;
+
+    debugLinePipelineDescription.
+        DepthStencilState.DepthWriteMask =
+        D3D12_DEPTH_WRITE_MASK_ZERO;
+
+    ThrowIfFailed(
+        device_->CreateGraphicsPipelineState(
+            &debugLinePipelineDescription,
+            IID_PPV_ARGS(
+                &debugLinePipelineState_)),
+        "Create LOD debug line pipeline");
+
+    debugLinePipelineState_->SetName(
+        L"LOD Node Bounds Debug Pipeline");
 
     constexpr std::array<
         DirectX::XMFLOAT2,
@@ -2032,7 +2089,8 @@ RecordPointTileUploadTransitions()
                 D3D12_RESOURCE_STATE_COPY_DEST;
 
             barrier.Transition.StateAfter =
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
 
             tile.needsCopyToClodSourceTransition =
                 false;
@@ -2628,25 +2686,65 @@ void D3D12Context::CollectCompletedClodReductions()
         slot.lastOverflowPointCount =
             control.overflowPointCount;
 
-        if (slot.lastOverflowPointCount != 0)
+        // CLOD's spacing rule determines density, so steer the
+        // factor toward the requested point budget after each
+        // completed reduction. Keep some dead-band around the
+        // target to avoid rebuilding forever over tiny count
+        // changes. The larger output buffer provides headroom while
+        // a dense result is being measured.
+        const std::uint64_t acceptedBeforeCapacity =
+            static_cast<std::uint64_t>(
+                slot.lastAcceptedPointCount)
+            + slot.lastOverflowPointCount;
+
+        const std::uint64_t effectiveTarget =
+            std::min<std::uint64_t>(
+                clodTargetPointCount_,
+                slot.expectedCandidateCount);
+
+        const bool factorIsStillCurrent =
+            std::abs(
+                clodFactor_
+                - slot.resultClodFactor) <= 0.0001f;
+
+        if (factorIsStillCurrent
+            && effectiveTarget != 0)
         {
-            // An overflowing append buffer is spatially biased
-            // toward whichever source points happened to be
-            // processed first. Make the following reduction
-            // coarser until its complete result fits.
-            constexpr float overflowRecoveryStep = 1.25f;
+            constexpr double lowerTargetFraction = 0.92;
+            constexpr double upperTargetFraction = 1.05;
+            constexpr float minimumAutomaticFactor = 0.125f;
             constexpr float maximumAutomaticFactor = 16.0f;
+            constexpr float minimumAdjustment = 0.8f;
+            constexpr float maximumAdjustment = 1.25f;
 
-            const float recoveryFactor =
-                std::min(
-                    slot.resultClodFactor
-                        * overflowRecoveryStep,
-                    maximumAutomaticFactor);
+            const double acceptedRatio =
+                static_cast<double>(
+                    acceptedBeforeCapacity)
+                / static_cast<double>(effectiveTarget);
 
-            clodFactor_ =
-                std::max(
-                    clodFactor_,
-                    recoveryFactor);
+            if (acceptedRatio < lowerTargetFraction
+                || acceptedRatio > upperTargetFraction)
+            {
+                // Point density over a surface changes roughly with
+                // the inverse square of spacing. The square root
+                // therefore gives a useful first estimate of the
+                // spacing-factor correction.
+                const float adjustment =
+                    acceptedBeforeCapacity == 0
+                    ? minimumAdjustment
+                    : std::clamp(
+                        static_cast<float>(
+                            std::sqrt(acceptedRatio)),
+                        minimumAdjustment,
+                        maximumAdjustment);
+
+                clodFactor_ =
+                    std::clamp(
+                        slot.resultClodFactor
+                            * adjustment,
+                        minimumAutomaticFactor,
+                        maximumAutomaticFactor);
+            }
         }
 
 
@@ -2707,8 +2805,13 @@ void D3D12Context::Render(
     CollectCompletedClodReductions();
 
     clodDrawnLastFrame_ = false;
+    clodDebugSelectedPointCount_ = 0;
 
-    if (!runClodReduction)
+    const bool runNormalClodReduction =
+        runClodReduction
+        && !clodLevelDebugEnabled_;
+
+    if (!runNormalClodReduction)
     {
         // Cancel only the unfinished build so its source snapshot
         // cannot pin tiles while Discrete mode is active. Keep the
@@ -2734,7 +2837,10 @@ void D3D12Context::Render(
         maximumElevation_;
 
     constants.pointColorMode =
-        static_cast<std::uint32_t>(
+        clodLevelDebugEnabled_
+        ? static_cast<std::uint32_t>(
+            PointColorMode::SourceColor)
+        : static_cast<std::uint32_t>(
             pointColorMode_);
 
     constants.clodFactor =
@@ -2757,6 +2863,17 @@ void D3D12Context::Render(
         &projection,
         camera.GetProjectionMatrix());
 
+    constants.clodProjectionScale =
+        static_cast<float>(height_)
+        * 0.5f
+        * projection._22;
+
+    // Five millimetres is a conservative scanner-density floor for
+    // the metre-scale data used by this renderer. Unlike a pixel
+    // minimum, its projected size grows naturally near the camera.
+    constants.clodMinimumPointSizeWorld =
+        0.005f;
+
     // targetSpacing grows linearly with distance:
     //
     //     distance * factor / 1000
@@ -2765,9 +2882,7 @@ void D3D12Context::Render(
     // distance. The resulting screen-space diameter is therefore
     // approximately constant.
     constants.clodPointSizePixels =
-        static_cast<float>(height_)
-        * 0.5f
-        * projection._22
+        constants.clodProjectionScale
         * clodFactor_
         / 1000.0f;
 
@@ -2784,6 +2899,88 @@ void D3D12Context::Render(
         currentFrame.mappedCameraData,
         &constants,
         sizeof(constants));
+
+    D3D12_VERTEX_BUFFER_VIEW
+        lodDebugLineBufferView{};
+
+    if (!lodDebugLineVertices_.empty())
+    {
+        const std::uint64_t requiredBytes =
+            static_cast<std::uint64_t>(
+                lodDebugLineVertices_.size())
+            * sizeof(GpuPoint);
+
+        if (requiredBytes
+            > std::numeric_limits<UINT>::max())
+        {
+            throw std::overflow_error(
+                "LOD debug line buffer is too large.");
+        }
+
+        if (requiredBytes
+            > currentFrame.
+                lodDebugLineCapacityBytes)
+        {
+            if (currentFrame.lodDebugLineBuffer
+                && currentFrame.
+                    mappedLodDebugLineData)
+            {
+                currentFrame.lodDebugLineBuffer->
+                    Unmap(0, nullptr);
+            }
+
+            currentFrame.mappedLodDebugLineData =
+                nullptr;
+
+            currentFrame.lodDebugLineBuffer.Reset();
+
+            currentFrame.lodDebugLineBuffer =
+                CreateBuffer(
+                    requiredBytes,
+                    D3D12_HEAP_TYPE_UPLOAD,
+                    D3D12_RESOURCE_STATE_GENERIC_READ);
+
+            currentFrame.lodDebugLineBuffer->SetName(
+                L"LOD Debug Line Upload Buffer");
+
+            void* mappedData = nullptr;
+
+            const D3D12_RANGE noCpuReads{
+                0,
+                0
+            };
+
+            ThrowIfFailed(
+                currentFrame.lodDebugLineBuffer->Map(
+                    0,
+                    &noCpuReads,
+                    &mappedData),
+                "Map LOD debug line buffer");
+
+            currentFrame.mappedLodDebugLineData =
+                static_cast<std::uint8_t*>(
+                    mappedData);
+
+            currentFrame.
+                lodDebugLineCapacityBytes =
+                requiredBytes;
+        }
+
+        std::memcpy(
+            currentFrame.mappedLodDebugLineData,
+            lodDebugLineVertices_.data(),
+            static_cast<std::size_t>(requiredBytes));
+
+        lodDebugLineBufferView.BufferLocation =
+            currentFrame.lodDebugLineBuffer->
+            GetGPUVirtualAddress();
+
+        lodDebugLineBufferView.SizeInBytes =
+            static_cast<UINT>(requiredBytes);
+
+        lodDebugLineBufferView.StrideInBytes =
+            sizeof(GpuPoint);
+    }
 
     ThrowIfFailed(
         currentFrame.commandAllocator->Reset(),
@@ -2811,7 +3008,7 @@ void D3D12Context::Render(
     std::optional<std::uint32_t>
         submittedClodReduction;
 
-    if (runClodReduction)
+    if (runNormalClodReduction)
     {
         submittedClodReduction =
             RecordClodReduction(camera);
@@ -2901,7 +3098,7 @@ void D3D12Context::Render(
         D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
 
     const bool canDrawClod =
-        runClodReduction
+        runNormalClodReduction
         && activeClodReductionSlotIndex_.has_value()
         && clodReductionSlots_[
             *activeClodReductionSlotIndex_].
@@ -2910,12 +3107,92 @@ void D3D12Context::Render(
             *activeClodReductionSlotIndex_].
         sourceGeneration == clodSourceGeneration_;
 
+    const bool canDrawClodDebug =
+        runClodReduction
+        && clodLevelDebugEnabled_
+        && std::any_of(
+            pointTiles_.begin(),
+            pointTiles_.end(),
+            [](const GpuPointTile& tile)
+            {
+                const std::uint64_t rangeEnd =
+                    static_cast<std::uint64_t>(
+                        tile.clodDebugDrawRange.firstPoint)
+                    + tile.clodDebugDrawRange.pointCount;
+
+                return
+                    tile.clodSourceBuffer
+                    && tile.clodDebugDrawRange.pointCount
+                        != 0
+                    && rangeEnd
+                        <= tile.uploadedClodPointCount;
+            });
+
     // The CPU knows that a complete reduction exists, but it
     // does not supply that reduction's point count.
     //
     // ExecuteIndirect reads InstanceCount directly from the
     // control buffer written by the compute shader.
-    if (canDrawClod)
+    if (canDrawClodDebug)
+    {
+        commandList_->SetPipelineState(
+            pipelineState_.Get());
+
+        commandList_->IASetPrimitiveTopology(
+            D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+
+        for (const GpuPointTile& tile :
+            pointTiles_)
+        {
+            const PointCloudDrawRange& range =
+                tile.clodDebugDrawRange;
+
+            const std::uint64_t rangeEnd =
+                static_cast<std::uint64_t>(
+                    range.firstPoint)
+                + range.pointCount;
+
+            if (!tile.clodSourceBuffer
+                || range.pointCount == 0
+                || rangeEnd
+                    > tile.uploadedClodPointCount)
+            {
+                continue;
+            }
+
+            D3D12_VERTEX_BUFFER_VIEW
+                clodSourceView{};
+
+            clodSourceView.BufferLocation =
+                tile.clodSourceBuffer->
+                GetGPUVirtualAddress();
+
+            clodSourceView.SizeInBytes =
+                static_cast<UINT>(
+                    tile.clodSizeBytes);
+
+            clodSourceView.StrideInBytes =
+                sizeof(ClodPoint);
+
+            commandList_->IASetVertexBuffers(
+                0,
+                1,
+                &clodSourceView);
+
+            commandList_->DrawInstanced(
+                range.pointCount,
+                1,
+                range.firstPoint,
+                0);
+
+            clodDebugSelectedPointCount_ +=
+                range.pointCount;
+        }
+
+        clodDrawnLastFrame_ =
+            clodDebugSelectedPointCount_ != 0;
+    }
+    else if (canDrawClod)
     {
         commandList_->SetPipelineState(
             clodDrawPipelineState_.Get());
@@ -3046,6 +3323,27 @@ void D3D12Context::Render(
                     0);
             }
         }
+    }
+
+    if (!lodDebugLineVertices_.empty())
+    {
+        commandList_->SetPipelineState(
+            debugLinePipelineState_.Get());
+
+        commandList_->IASetPrimitiveTopology(
+            D3D_PRIMITIVE_TOPOLOGY_LINELIST);
+
+        commandList_->IASetVertexBuffers(
+            0,
+            1,
+            &lodDebugLineBufferView);
+
+        commandList_->DrawInstanced(
+            static_cast<UINT>(
+                lodDebugLineVertices_.size()),
+            1,
+            0,
+            0);
     }
 
     D3D12_RESOURCE_BARRIER toPresent =
@@ -4225,6 +4523,149 @@ bool D3D12Context::SetPointCloudTileDrawRanges(
     return true;
 }
 
+bool D3D12Context::SetPointCloudTileClodDebugRange(
+    PointCloudTileId tileId,
+    PointCloudDrawRange drawRange)
+{
+    if (!initialized_)
+    {
+        throw std::logic_error(
+            "D3D12 must be initialized before "
+            "updating a CLOD debug range.");
+    }
+
+    const auto tileIterator =
+        std::find_if(
+            pointTiles_.begin(),
+            pointTiles_.end(),
+            [tileId](const GpuPointTile& tile)
+            {
+                return tile.id == tileId;
+            });
+
+    if (tileIterator == pointTiles_.end())
+    {
+        return false;
+    }
+
+    const std::uint64_t rangeEnd =
+        static_cast<std::uint64_t>(
+            drawRange.firstPoint)
+        + drawRange.pointCount;
+
+    // A discrete tile can exist before its asynchronous CLOD
+    // attachment finishes. Permit an empty range in that state,
+    // but never permit a range outside a completed source buffer.
+    if (drawRange.pointCount != 0
+        && (!tileIterator->clodSourceBuffer
+            || rangeEnd
+                > tileIterator->uploadedClodPointCount))
+    {
+        throw std::out_of_range(
+            "CLOD debug range exceeds the uploaded "
+            "CLOD source buffer.");
+    }
+
+    tileIterator->clodDebugDrawRange =
+        drawRange;
+
+    return true;
+}
+
+void D3D12Context::SetClodLevelDebugEnabled(
+    bool enabled) noexcept
+{
+    if (clodLevelDebugEnabled_ == enabled)
+    {
+        return;
+    }
+
+    clodLevelDebugEnabled_ = enabled;
+    clodDebugSelectedPointCount_ = 0;
+
+    // An exact-level draw does not use the reduced buffers. Reset
+    // an unfinished cycle so it cannot keep an old tile snapshot
+    // alive while the debug view is active.
+    clodReductionCycle_.Reset();
+}
+
+void D3D12Context::SetLodDebugBoxes(
+    std::span<const LodDebugBox> boxes)
+{
+    constexpr std::array<
+        std::array<std::uint32_t, 2>,
+        12>
+        edges{
+            std::array<std::uint32_t, 2>{ 0, 1 },
+            std::array<std::uint32_t, 2>{ 1, 2 },
+            std::array<std::uint32_t, 2>{ 2, 3 },
+            std::array<std::uint32_t, 2>{ 3, 0 },
+            std::array<std::uint32_t, 2>{ 4, 5 },
+            std::array<std::uint32_t, 2>{ 5, 6 },
+            std::array<std::uint32_t, 2>{ 6, 7 },
+            std::array<std::uint32_t, 2>{ 7, 4 },
+            std::array<std::uint32_t, 2>{ 0, 4 },
+            std::array<std::uint32_t, 2>{ 1, 5 },
+            std::array<std::uint32_t, 2>{ 2, 6 },
+            std::array<std::uint32_t, 2>{ 3, 7 }
+        };
+
+    if (boxes.size()
+        > std::numeric_limits<std::size_t>::max()
+            / (edges.size() * 2))
+    {
+        throw std::overflow_error(
+            "LOD debug line count overflow.");
+    }
+
+    std::vector<GpuPoint> vertices;
+    vertices.reserve(boxes.size() * edges.size() * 2);
+
+    for (const LodDebugBox& box : boxes)
+    {
+        if (!std::isfinite(box.minimum.x)
+            || !std::isfinite(box.minimum.y)
+            || !std::isfinite(box.minimum.z)
+            || !std::isfinite(box.maximum.x)
+            || !std::isfinite(box.maximum.y)
+            || !std::isfinite(box.maximum.z)
+            || box.minimum.x > box.maximum.x
+            || box.minimum.y > box.maximum.y
+            || box.minimum.z > box.maximum.z)
+        {
+            throw std::invalid_argument(
+                "LOD debug box bounds are invalid.");
+        }
+
+        const std::array<DirectX::XMFLOAT3, 8> corners{
+            DirectX::XMFLOAT3{ box.minimum.x, box.minimum.y, box.minimum.z },
+            DirectX::XMFLOAT3{ box.maximum.x, box.minimum.y, box.minimum.z },
+            DirectX::XMFLOAT3{ box.maximum.x, box.maximum.y, box.minimum.z },
+            DirectX::XMFLOAT3{ box.minimum.x, box.maximum.y, box.minimum.z },
+            DirectX::XMFLOAT3{ box.minimum.x, box.minimum.y, box.maximum.z },
+            DirectX::XMFLOAT3{ box.maximum.x, box.minimum.y, box.maximum.z },
+            DirectX::XMFLOAT3{ box.maximum.x, box.maximum.y, box.maximum.z },
+            DirectX::XMFLOAT3{ box.minimum.x, box.maximum.y, box.maximum.z }
+        };
+
+        for (const auto& edge : edges)
+        {
+            vertices.push_back({
+                corners[edge[0]],
+                box.color
+                });
+
+            vertices.push_back({
+                corners[edge[1]],
+                box.color
+                });
+        }
+    }
+
+    lodDebugLineVertices_ =
+        std::move(vertices);
+}
+
 bool D3D12Context::RemovePointCloudTile(
     PointCloudTileId tileId)
 {
@@ -4615,6 +5056,20 @@ void D3D12Context::Shutdown() noexcept
     for (FrameResource& frame :
         frameResources_)
     {
+        if (frame.lodDebugLineBuffer
+            && frame.mappedLodDebugLineData)
+        {
+            frame.lodDebugLineBuffer->Unmap(
+                0,
+                nullptr);
+
+            frame.mappedLodDebugLineData =
+                nullptr;
+        }
+
+        frame.lodDebugLineBuffer.Reset();
+        frame.lodDebugLineCapacityBytes = 0;
+
         if (frame.cameraBuffer
             && frame.mappedCameraData)
         {
@@ -4641,6 +5096,7 @@ void D3D12Context::Shutdown() noexcept
     lastCpuRenderMilliseconds_ = 0.0;
 
     pipelineState_.Reset();
+    debugLinePipelineState_.Reset();
     rootSignature_.Reset();
 
     fence_.Reset();
@@ -4681,6 +5137,9 @@ void D3D12Context::Shutdown() noexcept
     clodDrawPipelineState_.Reset();
     clodQuadVertexBuffer_.Reset();
     clodQuadVertexBufferView_ = {};
+    clodLevelDebugEnabled_ = false;
+    clodDebugSelectedPointCount_ = 0;
+    lodDebugLineVertices_.clear();
 
     device_.Reset();
     adapter_.Reset();
@@ -4758,6 +5217,15 @@ std::uint32_t
 D3D12Context::
 GetClodSelectedPointCount() const noexcept
 {
+    if (clodLevelDebugEnabled_)
+    {
+        return static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(
+                clodDebugSelectedPointCount_,
+                std::numeric_limits<
+                    std::uint32_t>::max()));
+    }
+
     if (!activeClodReductionSlotIndex_)
     {
         return 0;
@@ -4778,6 +5246,11 @@ std::uint32_t
 D3D12Context::
 GetClodOverflowPointCount() const noexcept
 {
+    if (clodLevelDebugEnabled_)
+    {
+        return 0;
+    }
+
     if (!activeClodReductionSlotIndex_)
     {
         return 0;

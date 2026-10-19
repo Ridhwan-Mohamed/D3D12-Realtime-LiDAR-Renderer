@@ -156,6 +156,50 @@ add_custom_command(
     VERBATIM
 )
 
+add_custom_command(
+    OUTPUT
+        "${GENERATED_SHADER_DIRECTORY}/DebugLinesVS.h"
+
+    COMMAND
+        "${DXC_EXECUTABLE}"
+        -T vs_6_0
+        -E VSMain
+        -WX
+        -Fh "${GENERATED_SHADER_DIRECTORY}/DebugLinesVS.h"
+        -Vn g_debugLinesVertexShader
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/DebugLines.hlsl"
+
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/DebugLines.hlsl"
+
+    COMMENT
+        "Compiling debug line vertex shader"
+
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT
+        "${GENERATED_SHADER_DIRECTORY}/DebugLinesPS.h"
+
+    COMMAND
+        "${DXC_EXECUTABLE}"
+        -T ps_6_0
+        -E PSMain
+        -WX
+        -Fh "${GENERATED_SHADER_DIRECTORY}/DebugLinesPS.h"
+        -Vn g_debugLinesPixelShader
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/DebugLines.hlsl"
+
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/DebugLines.hlsl"
+
+    COMMENT
+        "Compiling debug line pixel shader"
+
+    VERBATIM
+)
+
 add_custom_target(
     PointCloudShaders
 
@@ -165,6 +209,8 @@ add_custom_target(
         "${GENERATED_SHADER_DIRECTORY}/ClodReduceCS.h"
         "${GENERATED_SHADER_DIRECTORY}/ClodDrawVS.h"
         "${GENERATED_SHADER_DIRECTORY}/ClodDrawPS.h"
+        "${GENERATED_SHADER_DIRECTORY}/DebugLinesVS.h"
+        "${GENERATED_SHADER_DIRECTORY}/DebugLinesPS.h"
 )
 
 add_executable(PointCloudRenderer WIN32
@@ -198,6 +244,7 @@ target_sources(
         shaders/Reference.hlsl
         shaders/ClodReduce.hlsl
         shaders/ClodDraw.hlsl
+        shaders/DebugLines.hlsl
 )
 
 add_dependencies(

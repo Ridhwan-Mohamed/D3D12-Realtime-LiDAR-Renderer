@@ -4,6 +4,45 @@ A from-scratch Direct3D 12 point-cloud renderer for exploring large LAS, LAZ, an
 
 The project was built to study practical graphics systems: D3D12 resource ownership, frames in flight, copy and direct queues, GPU synchronization, spatial data structures, out-of-core residency, compute compaction, indirect drawing, and performance measurement.
 
+## Gallery: discrete LOD vs continuous LOD
+
+Each pair uses the same viewpoint and an approximately **3.5 million point draw budget**. The discrete renderer selects complete octree node ranges, while the continuous renderer evaluates points individually on the GPU. CLOD distributes the available points more evenly across the visible scene and avoids the sharp density boundaries created when entire nodes refine at once.
+
+<table>
+  <tr>
+    <th width="50%">Discrete octree LOD</th>
+    <th width="50%">GPU continuous LOD</th>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><strong>Yosemite Valley</strong></td>
+  </tr>
+  <tr>
+    <td><img src="photos/gallery/yosemite-lod.jpg" alt="Yosemite Valley rendered with discrete octree LOD"></td>
+    <td><img src="photos/gallery/yosemite-clod.jpg" alt="Yosemite Valley rendered with GPU continuous LOD"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><strong>Mount Rainier</strong></td>
+  </tr>
+  <tr>
+    <td><img src="photos/gallery/mount-rainier-lod.jpg" alt="Mount Rainier rendered with discrete octree LOD"></td>
+    <td><img src="photos/gallery/mount-rainier-clod.jpg" alt="Mount Rainier rendered with GPU continuous LOD"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><strong>Na Pali Coast</strong></td>
+  </tr>
+  <tr>
+    <td><img src="photos/gallery/na-pali-lod.jpg" alt="Na Pali Coast rendered with discrete octree LOD"></td>
+    <td><img src="photos/gallery/na-pali-clod.jpg" alt="Na Pali Coast rendered with GPU continuous LOD"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><strong>Sagrada Família</strong></td>
+  </tr>
+  <tr>
+    <td><img src="photos/gallery/sag-lod.jpg" alt="Sagrada Família rendered with discrete octree LOD"></td>
+    <td><img src="photos/gallery/sag-clod.jpg" alt="Sagrada Família rendered with GPU continuous LOD"></td>
+  </tr>
+</table>
+
 ## Highlights
 
 - Loads one or more `.las`, `.laz`, or `.copc.laz` files through LASzip.
@@ -105,7 +144,15 @@ Unloaded -> Queued -> Loading -> ReadyForUpload
 | `C` | Switch between Discrete and CLOD rendering |
 | `[` / `]` | Increase / decrease CLOD density |
 | `L` | Toggle budgeted discrete LOD / full detail |
+| `V` | Cycle CLOD view: normal, exact level 0, level 1, and so on |
+| `O` | Toggle selected discrete LOD node bounding boxes |
 | `B` | Run the fixed-view benchmark |
+
+The exact-level CLOD view draws the stored points for one additive
+level directly, using their dataset RGB values. The LOD box overlay
+keeps the selected points visible and colors each selected octree node
+green for leaves and red for internal nodes, which makes refinement
+changes easy to see while moving the camera.
 
 The benchmark appends its results to `PointCloudRenderer_Benchmark.txt` in the process working directory.
 
